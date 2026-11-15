@@ -557,6 +557,39 @@ describe('publishSharedGraph race (#3352)', () => {
     expect(seeded?.lastCommit).toBe(head);
   });
 
+  it('seeds a diverged sibling PR worktree for incremental hash-diff and rejects orphan history', async () => {
+    const { checkouts } = await setup();
+    const [main, wt] = checkouts;
+    // Advance main past the fork point and publish only main's advanced commit graph.
+    await fs.writeFile(path.join(main, 'main-only.ts'), 'export const m = 1;\n');
+    commitAll(main, 'advance main');
+    const mainHead = git(main, 'rev-parse', 'HEAD');
+    const mainSlot = layoutOf(main).checkoutSlot;
+    await saveMeta(mainSlot, {
+      ...((await loadMeta(mainSlot)) as RepoMeta),
+      lastCommit: mainHead,
+    });
+    await publishSharedGraph(layoutOf(main), main, mainHead, () => {});
+    const mainGraphPath = (await loadMeta(mainSlot))?.graphPath;
+    expect(mainGraphPath).toBeTruthy();
+
+    // Diverge wt independently from the original fork commit.
+    await fs.writeFile(path.join(wt, 'pr-only.ts'), 'export const p = 2;\n');
+    commitAll(wt, 'pr commit');
+    const seeded = await seedFreshSlot(wt);
+    expect(seeded?.graphPath).toBe(mainGraphPath);
+    expect(seeded?.lastCommit).toBe('');
+
+    // Unrelated orphan history must not seed from main's commit graph.
+    const orphanWt = path.join(path.dirname(main), 'wt-orphan');
+    git(main, 'worktree', 'add', '-q', '--detach', orphanWt);
+    git(orphanWt, 'checkout', '-q', '--orphan', 'unrelated');
+    git(orphanWt, 'rm', '-rf', '-q', '.');
+    await fs.writeFile(path.join(orphanWt, 'o.ts'), 'export const o = 3;\n');
+    commitAll(orphanWt, 'orphan commit');
+    expect(await seedFreshSlot(orphanWt)).toBeNull();
+  });
+
   it('seeds a checkout that hides committed files without a commit, then re-points', async () => {
     const { checkouts, head } = await setup();
     const [main, wt] = checkouts;

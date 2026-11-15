@@ -157,10 +157,18 @@ function handlerSymbolContent(
 const TEMPLATE_URL_PATTERNS: readonly RegExp[] = [
   /\b(?:action|href)\s*=\s*["']([^"']+)["']/gi,
   /\burl\s*:\s*["']([^"']+)["'](?!\s*\+)/g,
+  // JSTL <c:url value="/orders.xhtml" />
+  /<(?:c|spring):url\b[^>]*\bvalue\s*=\s*["']([^"']+)["']/gi,
+  // Static fetch/axios/jQuery string literals inside template <script> blocks
+  /(?:\b(?:fetch|axios(?:\.(?:get|post|put|delete|patch))?)|(?:\$|jQuery)\.(?:get|post|getJSON))\s*\(\s*["']([^"']+)["'](?!\s*\+)/g,
   // Laravel asset() points at static assets, not application routes; keep it
   // out of route matching so asset paths cannot collide with real route URLs.
   /\{\{[\s\S]{0,200}?\burl\(\s*["']([^"']+)["']\s*\)[\s\S]{0,200}?\}\}/g,
   /\{!![\s\S]{0,200}?\burl\(\s*["']([^"']+)["']\s*\)[\s\S]{0,200}?!\}/g,
+];
+
+const JSP_CONCAT_ACTION_PATTERNS: readonly RegExp[] = [
+  /(?:\bfetch\s*\(|\burl\s*:\s*|(?:\$|jQuery)\.(?:get|post|getJSON)\s*\()\s*["']([^"']*?\.(?:xhtml|action)\?[A-Za-z_][A-Za-z0-9_-]*[^"']*)["']\s*\+/gi,
 ];
 
 const TEMPLATE_NAMED_ROUTE_PATTERNS: readonly RegExp[] = [
@@ -175,6 +183,14 @@ function hasRouteParameters(routeUrl: string): boolean {
   return /\{[^}]+\}/.test(routeUrl);
 }
 
+function lineNumberAtOffset(content: string, offset: number): number {
+  let line = 0;
+  for (let i = 0; i < offset && i < content.length; i++) {
+    if (content.charCodeAt(i) === 10) line++;
+  }
+  return line;
+}
+
 export function extractTemplateStaticFetchCalls(
   filePath: string,
   content: string,
@@ -182,16 +198,82 @@ export function extractTemplateStaticFetchCalls(
 ): TemplateFetchCall[] {
   const calls: TemplateFetchCall[] = [];
   const seen = new Set<string>();
+  const isJspLike = /\.(?:jsp|jspf|tag|xhtml)$/i.test(filePath);
+
+  const pushNormalized = (rawUrl: string, offset: number): string | null => {
+    const normalized = normalizeFetchURL(rawUrl);
+    if (!normalized) return null;
+    if (!seen.has(normalized)) {
+      seen.add(normalized);
+      calls.push({ filePath, fetchURL: normalized, lineNumber: lineNumberAtOffset(content, offset) });
+    }
+    return normalized;
+  };
 
   for (const pattern of TEMPLATE_URL_PATTERNS) {
     pattern.lastIndex = 0;
     let match: RegExpExecArray | null;
     while ((match = pattern.exec(content)) !== null) {
-      const normalized = normalizeFetchURL(match[1]);
-      if (!normalized) continue;
-      if (seen.has(normalized)) continue;
-      seen.add(normalized);
-      calls.push({ filePath, fetchURL: normalized, lineNumber: 0 });
+      pushNormalized(match[1], match.index);
+    }
+  }
+
+  if (isJspLike) {
+    for (const pattern of JSP_CONCAT_ACTION_PATTERNS) {
+      pattern.lastIndex = 0;
+      let match: RegExpExecArray | null;
+      while ((match = pattern.exec(content)) !== null) {
+        pushNormalized(match[1], match.index);
+      }
+    }
+
+    // Stripes <s:form|link|url beanclass="..." / action="..."> + event bindings
+    let primaryStripesRouteUrl: string | null = null;
+    const beanClassRe = /\bbeanclass\s*=\s*(["'])([^"']+)\1/gi;
+    let bm: RegExpExecArray | null;
+    while ((bm = beanClassRe.exec(content)) !== null) {
+      const rawBean = bm[2].trim().replace(/\.class$/, '');
+      if (!rawBean || rawBean.startsWith('${')) continue;
+      const simpleBean = rawBean.split('.').pop() ?? rawBean;
+      const mapped = namedRouteUrls.get(rawBean) ?? namedRouteUrls.get(simpleBean);
+      if (mapped && !hasRouteParameters(mapped)) {
+        const norm = pushNormalized(mapped, bm.index);
+        if (norm && !primaryStripesRouteUrl) primaryStripesRouteUrl = norm;
+      }
+    }
+    if (!primaryStripesRouteUrl) {
+      const actionAttrRe = /<(?:stripes|s):(?:form|link|url)\b[^>]*\baction\s*=\s*(["'])([^"']+)\1/gi;
+      let am: RegExpExecArray | null;
+      while ((am = actionAttrRe.exec(content)) !== null) {
+        const norm = pushNormalized(am[2], am.index);
+        if (norm && !primaryStripesRouteUrl) primaryStripesRouteUrl = norm.split('!')[0];
+      }
+    }
+    if (primaryStripesRouteUrl) {
+      const stripesTagRe = /<(?:stripes|s):([\w-]+)\b([^>]*)>/gi;
+      let tm: RegExpExecArray | null;
+      while ((tm = stripesTagRe.exec(content)) !== null) {
+        const tagKind = tm[1].toLowerCase();
+        const attrs = tm[2] ?? '';
+        let tagRouteUrl = primaryStripesRouteUrl;
+        const localBean = /\bbeanclass\s*=\s*(["'])([^"']+)\1/i.exec(attrs)?.[2]?.trim();
+        if (localBean && !localBean.startsWith('${')) {
+          const cleanBean = localBean.replace(/\.class$/, '');
+          const resolvedLocal =
+            namedRouteUrls.get(cleanBean) ??
+            namedRouteUrls.get(cleanBean.split('.').pop() ?? cleanBean);
+          if (resolvedLocal) tagRouteUrl = resolvedLocal;
+        }
+        const eventAttr = /\bevent\s*=\s*(["'])([A-Za-z_][A-Za-z0-9_-]*)\1/.exec(attrs)?.[2];
+        if (eventAttr) {
+          pushNormalized(`${tagRouteUrl}!${eventAttr}`, tm.index);
+        } else if (tagKind === 'submit' || tagKind === 'button') {
+          const nameAttr = /\bname\s*=\s*(["'])([A-Za-z_][A-Za-z0-9_-]*)\1/.exec(attrs)?.[2];
+          if (nameAttr) {
+            pushNormalized(`${tagRouteUrl}!${nameAttr}`, tm.index);
+          }
+        }
+      }
     }
   }
 
@@ -202,11 +284,7 @@ export function extractTemplateStaticFetchCalls(
       const routeUrl = namedRouteUrls.get(match[1]);
       if (!routeUrl) continue;
       if (hasRouteParameters(routeUrl)) continue;
-      const normalized = normalizeFetchURL(routeUrl);
-      if (!normalized) continue;
-      if (seen.has(normalized)) continue;
-      seen.add(normalized);
-      calls.push({ filePath, fetchURL: normalized, lineNumber: 0 });
+      pushNormalized(routeUrl, match.index);
     }
   }
 
@@ -362,8 +440,15 @@ export const routesPhase: PipelinePhase<RoutesOutput> = {
     // idiom, which no single file can reconcile. Framework routes are untouched;
     // their verb-less form is a declaration, not a weaker observation.
     for (const dr of reconcileDispatchGuardRoutes(allDecoratorRoutes)) {
-      if (selectedRoutes && !selectedRoutes.has(dr)) continue;
       const url = normalizeExtractedRoutePath(dr.routePath, dr.prefix ?? null);
+      if (dr.routeNames) {
+        for (const rn of dr.routeNames) {
+          if (rn && !namedRouteRegistry.has(rn)) {
+            namedRouteRegistry.set(rn, url);
+          }
+        }
+      }
+      if (selectedRoutes && !selectedRoutes.has(dr)) continue;
       const method = normalizeRouteMethod(dr.httpMethod);
       const routeKey = routeNodeKey(method, url);
       // A data-table entry is only a provider route once its static handler has
@@ -377,6 +462,61 @@ export const routesPhase: PipelinePhase<RoutesOutput> = {
         source: dr.source ?? `decorator-${dr.decoratorName}`,
         method,
       });
+    }
+
+    // Parse WEB-INF/web.xml <servlet> + <servlet-mapping> declarations for
+    // application servlets backed by repository Java source files.
+    const webXmlPaths = allPaths.filter((p) => /(?:^|\/)web\.xml$/i.test(p));
+    if (webXmlPaths.length > 0) {
+      const webXmlContents = await readFileContents(ctx.repoPath, webXmlPaths);
+      for (const [, xml] of webXmlContents) {
+        const servletClassByName = new Map<string, string>();
+        const servletBlockRe = /<servlet\b[^>]*>([\s\S]*?)<\/servlet>/gi;
+        let sb: RegExpExecArray | null;
+        while ((sb = servletBlockRe.exec(xml)) !== null) {
+          const name = /<servlet-name>\s*([^<\s]+)\s*<\/servlet-name>/i.exec(sb[1])?.[1];
+          const cls = /<servlet-class>\s*([^<\s]+)\s*<\/servlet-class>/i.exec(sb[1])?.[1];
+          if (!name || !cls) continue;
+          if (
+            cls.startsWith('org.springframework.') ||
+            cls.startsWith('org.apache.') ||
+            cls.startsWith('javax.') ||
+            cls.startsWith('jakarta.') ||
+            cls.startsWith('net.sourceforge.stripes.')
+          ) {
+            continue;
+          }
+          servletClassByName.set(name, cls);
+        }
+        if (servletClassByName.size === 0) continue;
+
+        const mappingBlockRe = /<servlet-mapping\b[^>]*>([\s\S]*?)<\/servlet-mapping>/gi;
+        let mb: RegExpExecArray | null;
+        while ((mb = mappingBlockRe.exec(xml)) !== null) {
+          const name = /<servlet-name>\s*([^<\s]+)\s*<\/servlet-name>/i.exec(mb[1])?.[1];
+          const servletClass = name ? servletClassByName.get(name) : undefined;
+          if (!servletClass) continue;
+          const javaSuffix = `/${servletClass.replace(/\./g, '/')}.java`;
+          const handlerFile = allPaths.find((p) => p.endsWith(javaSuffix) || p === javaSuffix.slice(1));
+          if (!handlerFile) continue;
+
+          const urlPatRe = /<url-pattern>\s*([^<\s]+)\s*<\/url-pattern>/gi;
+          let up: RegExpExecArray | null;
+          while ((up = urlPatRe.exec(mb[1])) !== null) {
+            const rawPat = up[1].trim();
+            if (!rawPat || rawPat === '/' || rawPat === '/*' || rawPat.startsWith('*.')) continue;
+            const normUrl = normalizeExtractedRoutePath(
+              rawPat.endsWith('/*') ? `${rawPat.slice(0, -2)}/[...path]` : rawPat,
+              null,
+            );
+            addRoute(normUrl, {
+              filePath: handlerFile,
+              source: 'web-xml-servlet',
+              method: '*',
+            });
+          }
+        }
+      }
     }
 
     let handlerContents: Map<string, string> | undefined;

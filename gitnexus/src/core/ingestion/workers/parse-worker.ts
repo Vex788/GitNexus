@@ -3,6 +3,7 @@ import {
   type FetchWrapperFacts,
   type FetchWrapperReexport,
 } from '../route-extractors/fetch-wrapper.js';
+import { extractExtendedHttpClientCalls } from '../route-extractors/extended-http-clients.js';
 import { parentPort, threadId, workerData } from 'node:worker_threads';
 import {
   boundCallableStartPosition,
@@ -449,6 +450,17 @@ export interface ExtractedDecoratorRoute {
    * the only thing that differs downstream, so it travels as a field instead of
    * as a parallel extraction channel.
    */
+  /**
+   * Optional non-literal class-level prefix expression and its parsed operands
+   * (for example `@RequestMapping(ApiPaths.BASE)`), folded cross-file in `parse-impl`.
+   */
+  prefixExpr?: string;
+  prefixOperands?: Operand[];
+  /**
+   * Optional named aliases (e.g. Stripes ActionBean class simple name & FQCN)
+   * registered into `namedRouteRegistry` so template bindings resolve directly.
+   */
+  routeNames?: string[];
   source?: string;
 }
 
@@ -3285,6 +3297,31 @@ const processFileGroupFiles = (
             facts: routeFacts,
             routePosition,
           });
+        if (
+          language === SupportedLanguages.JavaScript ||
+          language === SupportedLanguages.TypeScript ||
+          language === SupportedLanguages.Python
+        ) {
+          const stripOuterQuotes = (s: string) => s.replace(/^['"`]|['"`]$/g, '');
+          const seenFetchKeys = new Set(
+            result.fetchCalls
+              .filter((fc) => fc.fetchURL.length > 0)
+              .map((fc) => `${fc.lineNumber}:${stripOuterQuotes(fc.fetchURL)}`),
+          );
+          for (const extra of extractExtendedHttpClientCalls(
+            tree.rootNode,
+            file.path,
+            language,
+            lineOffset,
+            requestEnclosingId,
+          )) {
+            const key = `${extra.lineNumber}:${stripOuterQuotes(extra.fetchURL)}`;
+            if (!seenFetchKeys.has(key)) {
+              seenFetchKeys.add(key);
+              result.fetchCalls.push(extra);
+            }
+          }
+        }
       } catch (err) {
         httpFailure(err);
       }

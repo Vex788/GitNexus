@@ -1299,3 +1299,40 @@ describe('isWorkingTreePristine', () => {
     }
   });
 });
+
+describe('sharedHistoryCommitDistance', () => {
+  it('measures ancestor distance, diverged sibling distance, and rejects orphan history', async () => {
+    const { sharedHistoryCommitDistance } = await import('../../src/storage/git.js');
+    const repo = makeIsolatedTempDir('gn-shared-dist-');
+    const git = (...args: string[]): string =>
+      execFileSync(gitExecutable, args, { cwd: repo, encoding: 'utf8', stdio: 'pipe' }).trim();
+    const commitFile = (file: string, content: string, msg: string): string => {
+      fs.writeFileSync(path.join(repo, file), content);
+      git('add', file);
+      git('-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-q', '-m', msg);
+      return git('rev-parse', 'HEAD');
+    };
+    try {
+      git('init', '-q', '-b', 'develop');
+      const base = commitFile('a.ts', 'export const a = 1;\n', 'base');
+      const dev1 = commitFile('b.ts', 'export const b = 1;\n', 'dev1');
+      const dev2 = commitFile('c.ts', 'export const c = 1;\n', 'dev2');
+
+      git('checkout', '-q', '--orphan', 'orphan');
+      git('rm', '-rf', '-q', '.');
+      const orphan = commitFile('o.ts', 'export const o = 1;\n', 'orphan');
+
+      git('checkout', '-q', '-b', 'pr-feature', base);
+      const prHead = commitFile('pr.ts', 'export const pr = 1;\n', 'pr1');
+
+      expect(sharedHistoryCommitDistance(repo, prHead)).toEqual({ distance: 0, isAncestor: true });
+      expect(sharedHistoryCommitDistance(repo, base)).toEqual({ distance: 1, isAncestor: true });
+      expect(sharedHistoryCommitDistance(repo, dev1)).toEqual({ distance: 2, isAncestor: false });
+      expect(sharedHistoryCommitDistance(repo, dev2)).toEqual({ distance: 3, isAncestor: false });
+      expect(sharedHistoryCommitDistance(repo, orphan)).toBeNull();
+      expect(sharedHistoryCommitDistance(repo, 'deadbeefdeadbeef')).toBeNull();
+    } finally {
+      fs.rmSync(repo, { recursive: true, force: true });
+    }
+  });
+});

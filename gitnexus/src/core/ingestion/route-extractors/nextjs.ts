@@ -59,20 +59,75 @@ function collapseInterpolations(url: string): string {
   return out;
 }
 
+const IGNORED_STRIPES_QUERY_KEYS = new Set(['ajax', 'ts', '_', 'id', 'page', 'limit', 'offset']);
+
+/**
+ * Extract a Stripes event name from a `.xhtml` / `.action` query string when
+ * present (`?save-filters`, `?addnotes&ajax=true`, `?_eventName=save`, `?event=save`).
+ */
+function extractStripesQueryEvent(pathPart: string, queryPart: string | undefined): string | null {
+  if (!queryPart || !/\.(?:xhtml|action)$/i.test(pathPart)) return null;
+  const params = queryPart.split('&').filter(Boolean);
+  for (const param of params) {
+    const eqIdx = param.indexOf('=');
+    if (eqIdx > 0) {
+      const key = param.slice(0, eqIdx).trim();
+      const val = param.slice(eqIdx + 1).trim();
+      if ((key === '_eventName' || key === 'event') && /^[A-Za-z_][A-Za-z0-9_-]*$/.test(val)) {
+        return val;
+      }
+    }
+  }
+  const first = params[0]?.trim();
+  if (!first) return null;
+  const eqIdx = first.indexOf('=');
+  if (eqIdx < 0) {
+    if (/^[A-Za-z_][A-Za-z0-9_-]*$/.test(first) && !IGNORED_STRIPES_QUERY_KEYS.has(first)) {
+      return first;
+    }
+  } else if (eqIdx === first.length - 1) {
+    const key = first.slice(0, eqIdx);
+    if (/^[A-Za-z_][A-Za-z0-9_-]*$/.test(key) && !IGNORED_STRIPES_QUERY_KEYS.has(key)) {
+      return key;
+    }
+  }
+  return null;
+}
+
 // Normalise a fetch URL so it can be matched against route patterns.
 // - Strips a leading base-URL binding (`${backendUrl}/api/x` → `/api/x`, #3488)
+// - Strips JSP context-path prefixes and normalizes relative `.xhtml`/`.action` URLs
+// - Preserves Stripes event dispatch tokens (`foo.xhtml?save` → `/foo.xhtml!save`)
 // - Strips query strings (?page=1), including one built inside an interpolation
 // - Replaces template-literal expressions (${slug}) with [param]
 // - Returns null for URLs that cannot be statically resolved (string
 //   concatenation, function calls, non-API paths).
 export function normalizeFetchURL(rawURL: string): string | null {
-  const unquoted = rawURL.replace(/^`|`$/g, '');
+  let unquoted = rawURL.trim().replace(/^['"`]|['"`]$/g, '');
+  // Strip JSP context-path / JSTL prefixes (`${pageContext.request.contextPath}/foo.xhtml`)
+  unquoted = unquoted
+    .replace(/^<%=\s*request\.getContextPath\(\)\s*%>/, '')
+    .replace(/^\$\{\s*pageContext\.request\.contextPath\s*\}/, '')
+    .replace(/^\$\{\s*contextPath\s*\}/, '');
+  // Normalize relative `./foo.xhtml` or bare `foo.xhtml` / `foo.action` action bindings
+  const relActionMatch = unquoted.match(
+    /^(?:\.\/)?([A-Za-z0-9_][A-Za-z0-9_./-]*\.(?:xhtml|action))([?!#].*)?$/i,
+  );
+  if (relActionMatch && !unquoted.includes('://')) {
+    unquoted = `/${relActionMatch[1]}${relActionMatch[2] ?? ''}`;
+  }
+
   const unbound = stripLeadingTemplatePrefix(unquoted);
   if (unbound === null) return null;
   // Collapse interpolations before splitting, so the `?` of
   // `${repo ? `?repo=${repo}` : ''}` does not end the path; one glued to the
   // end of the last static segment is a query or suffix, not a segment.
-  let url = collapseInterpolations(unbound).split('?')[0];
+  const collapsed = collapseInterpolations(unbound);
+  const qIdx = collapsed.indexOf('?');
+  const rawPathPart = qIdx >= 0 ? collapsed.slice(0, qIdx) : collapsed;
+  const rawQueryPart = qIdx >= 0 ? collapsed.slice(qIdx + 1) : undefined;
+  const stripesEvent = extractStripesQueryEvent(rawPathPart, rawQueryPart);
+  let url = stripesEvent ? `${rawPathPart}!${stripesEvent}` : rawPathPart;
   url = url.replace(/([^/\uE000])\uE000+$/, '$1').replace(/\uE000/g, '[param]');
   // Strip file extensions from URLs (PHP projects use /api/upload.php but routes are /api/upload)
   url = url.replace(/\.(php|asp|aspx|jsp|cgi)$/, '');

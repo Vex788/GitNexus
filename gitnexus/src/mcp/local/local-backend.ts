@@ -668,6 +668,78 @@ interface ImpactFrontierEdge {
   staticGated?: boolean;
 }
 
+const extractFetchViaIds = (reason: unknown): string[] =>
+  typeof reason === 'string' && reason.includes('|via:')
+    ? [...reason.matchAll(/\|via:([^|]+)/g)].map((m) => m[1]).filter(Boolean)
+    : [];
+
+const inferNodeLabel = (rawLabel: unknown, id: string): string => {
+  if (typeof rawLabel === 'string' && rawLabel.length > 0) return rawLabel;
+  const colonIdx = id.indexOf(':');
+  if (colonIdx <= 0) return 'Symbol';
+  const prefix = id.slice(0, colonIdx);
+  switch (prefix.toLowerCase()) {
+    case 'file':
+      return 'File';
+    case 'func':
+    case 'function':
+      return 'Function';
+    case 'method':
+      return 'Method';
+    case 'constructor':
+      return 'Constructor';
+    case 'class':
+      return 'Class';
+    case 'interface':
+      return 'Interface';
+    case 'route':
+      return 'Route';
+    default:
+      return prefix;
+  }
+};
+
+const extractFilePathFromNodeId = (id: string): string | undefined => {
+  if (id.startsWith('File:')) return id.slice(5) || undefined;
+  if (id.startsWith('file:')) return id.slice(5) || undefined;
+  const firstColon = id.indexOf(':');
+  if (firstColon <= 0) return undefined;
+  const rest = id.slice(firstColon + 1);
+  const lastColon = rest.lastIndexOf(':');
+  if (lastColon <= 0) return undefined;
+  return rest.slice(0, lastColon) || undefined;
+};
+
+async function resolveCallableNodesByIds(
+  lbugPath: string,
+  viaIds: string[],
+): Promise<Map<string, { id: string; name: string; type: string; filePath: string }>> {
+  const out = new Map<string, { id: string; name: string; type: string; filePath: string }>();
+  if (viaIds.length === 0) return out;
+  const rows = await executeParameterized(
+    lbugPath,
+    `
+    MATCH (fn:Function) WHERE fn.id IN $viaIds
+    RETURN fn.id AS id, fn.name AS name, 'Function' AS type, fn.filePath AS filePath
+    UNION ALL
+    MATCH (fn:Method) WHERE fn.id IN $viaIds
+    RETURN fn.id AS id, fn.name AS name, 'Method' AS type, fn.filePath AS filePath
+    UNION ALL
+    MATCH (fn:Constructor) WHERE fn.id IN $viaIds
+    RETURN fn.id AS id, fn.name AS name, 'Constructor' AS type, fn.filePath AS filePath
+  `,
+    { viaIds },
+  );
+  for (const row of rows) {
+    const id = String(row.id ?? row[0] ?? '');
+    const name = String(row.name ?? row[1] ?? '');
+    const type = String(row.type ?? row[2] ?? 'Function');
+    const filePath = String(row.filePath ?? row[3] ?? '');
+    if (id && name) out.set(id, { id, name, type, filePath });
+  }
+  return out;
+}
+
 /**
  * Sort rank for the `confidence DESC` leg of {@link compareImpactEdgeStrength}.
  * A null/non-numeric confidence ranks LAST (weakest), so a stored measurement
@@ -6001,6 +6073,169 @@ export class LocalBackend {
       logQueryError('context:route-lookup', e);
     }
 
+    // Cross-boundary FE <-> BE route bridge for context():
+    // 1. When this symbol handles HTTP routes, resolve frontend consumers (`FETCHES` + `|via:`).
+    // 2. When this symbol issues HTTP requests, resolve target routes and backend handlers.
+    const routeConsumers: Array<{
+      uid: string;
+      name: string;
+      filePath: string;
+      kind: string;
+      url: string;
+      method?: string;
+    }> = [];
+    const fetchesRoutes: Array<{
+      url: string;
+      method?: string;
+      handlers?: Array<{ uid: string; name: string; filePath: string; kind: string }>;
+    }> = [];
+    try {
+      const symFilePath = String(sym.filePath ?? sym[3] ?? '');
+      if (routes.length > 0) {
+        const consumerRows = await executeParameterized(
+          repo.lbugPath,
+          `
+          MATCH (consumer)-[fr:CodeRelation]->(route:Route)<-[hr:CodeRelation]-(h)
+          WHERE h.id = $symId AND hr.type = $handlesRel AND fr.type = $fetchesRel
+          RETURN consumer.id AS uid, consumer.name AS name, consumer.filePath AS filePath,
+                 labels(consumer) AS kind, fr.reason AS reason, route.name AS url, route.method AS method
+          ORDER BY uid, url, method
+          LIMIT 50
+        `,
+          { symId, handlesRel: 'HANDLES_ROUTE', fetchesRel: 'FETCHES' },
+        );
+        const allViaIds = new Set<string>();
+        for (const row of consumerRows) {
+          for (const viaId of extractFetchViaIds(row.reason ?? row[4])) allViaIds.add(viaId);
+        }
+        const resolvedVias = await resolveCallableNodesByIds(repo.lbugPath, [...allViaIds]);
+        const seenIncoming = new Set(
+          incomingRows.map((r: any) => `${r.relType || r[0]}:${r.uid || r[1]}`),
+        );
+        const seenConsumers = new Set<string>();
+        for (const row of consumerRows) {
+          const url = String(row.url ?? row[5] ?? '');
+          if (!url) continue;
+          const rawMethod = row.method ?? row[6];
+          const method = typeof rawMethod === 'string' && rawMethod ? rawMethod : undefined;
+          const viaIds = extractFetchViaIds(row.reason ?? row[4]);
+          const targets: Array<{ uid: string; name: string; filePath: string; kind: string }> = [];
+          for (const viaId of viaIds) {
+            const fn = resolvedVias.get(viaId);
+            if (fn) {
+              targets.push({ uid: fn.id, name: fn.name, filePath: fn.filePath, kind: fn.type });
+            }
+          }
+          if (targets.length === 0) {
+            const uid = String(row.uid ?? row[0] ?? '');
+            const name = String(row.name ?? row[1] ?? '');
+            const filePath = String(row.filePath ?? row[2] ?? '');
+            const kind = inferNodeLabel(row.kind ?? row[3], uid);
+            if (uid && name) targets.push({ uid, name, filePath, kind });
+          }
+          for (const t of targets) {
+            const consumerKey = `${t.uid}|${method ?? ''}|${url}`;
+            if (!seenConsumers.has(consumerKey)) {
+              seenConsumers.add(consumerKey);
+              routeConsumers.push({ ...t, url, ...(method ? { method } : {}) });
+            }
+            const incomingKey = `FETCHES:${t.uid}`;
+            if (!seenIncoming.has(incomingKey)) {
+              seenIncoming.add(incomingKey);
+              incomingRows.push({
+                relType: 'FETCHES',
+                uid: t.uid,
+                name: t.name,
+                filePath: t.filePath,
+                kind: t.kind,
+              });
+            }
+          }
+        }
+      }
+
+      if (symId) {
+        const fetchRows = await executeParameterized(
+          repo.lbugPath,
+          `
+          MATCH (consumer)-[fr:CodeRelation]->(route:Route)
+          WHERE fr.type = $fetchesRel AND (consumer.id = $symId OR consumer.filePath = $symFile)
+          OPTIONAL MATCH (handler)-[hr:CodeRelation]->(route)
+          WHERE hr.type = $handlesRel
+          RETURN consumer.id AS consumerId, fr.reason AS reason, route.name AS url, route.method AS method,
+                 handler.id AS uid, handler.name AS name, handler.filePath AS filePath, labels(handler) AS kind
+          ORDER BY consumerId, url, method, uid
+          LIMIT 100
+        `,
+          {
+            symId,
+            symFile: symFilePath || '__none__',
+            fetchesRel: 'FETCHES',
+            handlesRel: 'HANDLES_ROUTE',
+          },
+        );
+        const byRouteKey = new Map<
+          string,
+          {
+            url: string;
+            method?: string;
+            handlers: Map<string, { uid: string; name: string; filePath: string; kind: string }>;
+          }
+        >();
+        const seenOutgoing = new Set(
+          outgoingRows.map((r: any) => `${r.relType || r[0]}:${r.uid || r[1]}`),
+        );
+        for (const row of fetchRows) {
+          const consumerId = String(row.consumerId ?? row[0] ?? '');
+          const reason = row.reason ?? row[1];
+          if (consumerId !== symId && !extractFetchViaIds(reason).includes(symId)) continue;
+          const url = String(row.url ?? row[2] ?? '');
+          if (!url) continue;
+          const rawMethod = row.method ?? row[3];
+          const method = typeof rawMethod === 'string' && rawMethod ? rawMethod : undefined;
+          const rKey = routeEnrichmentKey(method, url);
+          let entry = byRouteKey.get(rKey);
+          if (!entry) {
+            entry = { url, ...(method ? { method } : {}), handlers: new Map() };
+            byRouteKey.set(rKey, entry);
+          }
+          const hUid = String(row.uid ?? row[4] ?? '');
+          const hName = String(row.name ?? row[5] ?? '');
+          if (hUid && hName) {
+            const hFile = String(row.filePath ?? row[6] ?? '');
+            const hKind = inferNodeLabel(row.kind ?? row[7], hUid);
+            entry.handlers.set(hUid, { uid: hUid, name: hName, filePath: hFile, kind: hKind });
+          }
+        }
+        for (const entry of byRouteKey.values()) {
+          const allHandlers = [...entry.handlers.values()];
+          const symbolHandlers = allHandlers.filter((h) => h.kind !== 'File');
+          const chosen = symbolHandlers.length > 0 ? symbolHandlers : allHandlers;
+          fetchesRoutes.push({
+            url: entry.url,
+            ...(entry.method ? { method: entry.method } : {}),
+            ...(chosen.length > 0 ? { handlers: chosen } : {}),
+          });
+          for (const h of chosen) {
+            const outKey = `FETCHES:${h.uid}`;
+            if (!seenOutgoing.has(outKey)) {
+              seenOutgoing.add(outKey);
+              outgoingRows.push({
+                relType: 'FETCHES',
+                uid: h.uid,
+                name: h.name,
+                filePath: h.filePath,
+                kind: h.kind,
+              });
+            }
+          }
+        }
+      }
+    } catch (e) {
+      rethrowSymbolIdentityError(e);
+      logQueryError('context:cross-boundary-routes', e);
+    }
+
     // Helper to categorize refs
     const categorize = (rows: any[]) => {
       const cats: Record<string, any[]> = {};
@@ -6139,6 +6374,8 @@ export class LocalBackend {
         : {}),
       ...(isEntryPoint ? { is_entry_point: true } : {}),
       ...(routes.length > 0 ? { routes } : {}),
+      ...(routeConsumers.length > 0 ? { route_consumers: routeConsumers } : {}),
+      ...(fetchesRoutes.length > 0 ? { fetches_routes: fetchesRoutes } : {}),
       processes: processRows.map((r: any) => ({
         id: r.pid || r[0],
         name: r.label || r[1],
@@ -8900,6 +9137,9 @@ export class LocalBackend {
     void aopMetadataPromise.catch(() => undefined);
     const impacted: any[] = [];
     const visited = new Set<string>([symId]);
+    const filePathByNodeId = new Map<string, string>();
+    const seedFilePath = String(sym.filePath ?? sym[3] ?? '');
+    if (seedFilePath) filePathByNodeId.set(symId, seedFilePath);
     const pdgBridgeEvidenceById = new Map<string, PdgBridgeEvidenceInfo>();
     let frontier = [symId];
     const objectCallableFrontier: string[] = [];
@@ -9197,6 +9437,172 @@ export class LocalBackend {
           ...((rel.staticGated ?? rel[7]) === true ? { staticGated: true } : {}),
         }));
 
+        // Cross-boundary FE <-> BE HTTP route bridge:
+        // - upstream: backend handler -> Route <- FETCHES (resolving |via:<callableId> or consumer node)
+        // - downstream: frontend callable/file -[FETCHES]-> Route <-[HANDLES_ROUTE]- backend handler
+        if (
+          !opts.pdgBridge &&
+          (!opts.hasExplicitRelationTypes ||
+            relationTypes.includes('FETCHES') ||
+            relationTypes.includes('HANDLES_ROUTE'))
+        ) {
+          try {
+            if (direction === 'upstream') {
+              const bridgeRows = await executeParameterized(
+                repo.lbugPath,
+                `
+                MATCH (consumer)-[fr:CodeRelation]->(route:Route)<-[hr:CodeRelation]-(h)
+                WHERE h.id IN $bridgeIds AND hr.type = $handlesRel AND fr.type = $fetchesRel
+                RETURN h.id AS sourceId, consumer.id AS id, consumer.name AS name,
+                       labels(consumer) AS type, consumer.filePath AS filePath,
+                       fr.reason AS reason, fr.confidence AS confidence
+                ORDER BY sourceId, id
+                LIMIT 500
+              `,
+                {
+                  bridgeIds: frontier,
+                  handlesRel: 'HANDLES_ROUTE',
+                  fetchesRel: 'FETCHES',
+                },
+              );
+              const viaSet = new Set<string>();
+              for (const row of bridgeRows) {
+                for (const viaId of extractFetchViaIds(row.reason ?? row[5])) viaSet.add(viaId);
+              }
+              const resolvedVias = await resolveCallableNodesByIds(repo.lbugPath, [...viaSet]);
+              for (const row of bridgeRows) {
+                const sourceId = String(row.sourceId ?? row[0] ?? '');
+                const consumerId = String(row.id ?? row[1] ?? '');
+                if (!sourceId || !consumerId) continue;
+                const rawConf = row.confidence ?? row[6];
+                const conf = typeof rawConf === 'number' && rawConf > 0 ? rawConf : 0.9;
+                if (safeMinConfidence > 0 && conf < safeMinConfidence) continue;
+                const viaIds = extractFetchViaIds(row.reason ?? row[5]);
+                let addedVia = false;
+                for (const viaId of viaIds) {
+                  const fn = resolvedVias.get(viaId);
+                  if (fn) {
+                    edges.push({
+                      id: fn.id,
+                      name: fn.name,
+                      type: fn.type,
+                      filePath: fn.filePath,
+                      relType: 'FETCHES',
+                      confidence: conf,
+                      sourceId,
+                    });
+                    addedVia = true;
+                  }
+                }
+                if (!addedVia) {
+                  edges.push({
+                    id: consumerId,
+                    name: row.name ?? row[2] ?? consumerId,
+                    type: inferNodeLabel(row.type ?? row[3], consumerId),
+                    filePath: String(row.filePath ?? row[4] ?? ''),
+                    relType: 'FETCHES',
+                    confidence: conf,
+                    sourceId,
+                  });
+                }
+              }
+            } else {
+              const frontierSet = new Set(frontier);
+              const bridgeFiles = [
+                ...new Set(
+                  frontier
+                    .map((id) => filePathByNodeId.get(id) ?? extractFilePathFromNodeId(id))
+                    .filter((fp): fp is string => Boolean(fp)),
+                ),
+              ];
+              const bridgeRows = await executeParameterized(
+                repo.lbugPath,
+                `
+                MATCH (consumer)-[fr:CodeRelation]->(route:Route)<-[hr:CodeRelation]-(handler)
+                WHERE fr.type = $fetchesRel AND hr.type = $handlesRel
+                  AND (consumer.id IN $bridgeIds OR consumer.filePath IN $bridgeFiles)
+                RETURN consumer.id AS consumerId, fr.reason AS reason, fr.confidence AS confidence,
+                       route.id AS routeId, handler.id AS id, handler.name AS name,
+                       labels(handler) AS type, handler.filePath AS filePath
+                ORDER BY consumerId, routeId, id
+                LIMIT 500
+              `,
+                {
+                  bridgeIds: frontier,
+                  bridgeFiles: bridgeFiles.length > 0 ? bridgeFiles : ['__none__'],
+                  fetchesRel: 'FETCHES',
+                  handlesRel: 'HANDLES_ROUTE',
+                },
+              );
+              const groupedHandlers = new Map<
+                string,
+                Array<{
+                  sourceId: string;
+                  id: string;
+                  name: unknown;
+                  type: string;
+                  filePath: string;
+                  confidence: number;
+                }>
+              >();
+              for (const row of bridgeRows) {
+                const consumerId = String(row.consumerId ?? row[0] ?? '');
+                const reason = row.reason ?? row[1];
+                const rawConf = row.confidence ?? row[2];
+                const conf = typeof rawConf === 'number' && rawConf > 0 ? rawConf : 0.9;
+                if (safeMinConfidence > 0 && conf < safeMinConfidence) continue;
+                const routeId = String(row.routeId ?? row[3] ?? '');
+                const handlerId = String(row.id ?? row[4] ?? '');
+                if (!handlerId || !routeId) continue;
+                const matchedSources: string[] = [];
+                if (frontierSet.has(consumerId)) matchedSources.push(consumerId);
+                for (const viaId of extractFetchViaIds(reason)) {
+                  if (frontierSet.has(viaId) && !matchedSources.includes(viaId)) {
+                    matchedSources.push(viaId);
+                  }
+                }
+                if (matchedSources.length === 0) continue;
+                const handlerType = inferNodeLabel(row.type ?? row[6], handlerId);
+                const handlerFile = String(row.filePath ?? row[7] ?? '');
+                for (const srcId of matchedSources) {
+                  const key = `${srcId}|${routeId}`;
+                  let list = groupedHandlers.get(key);
+                  if (!list) {
+                    list = [];
+                    groupedHandlers.set(key, list);
+                  }
+                  list.push({
+                    sourceId: srcId,
+                    id: handlerId,
+                    name: row.name ?? row[5] ?? handlerId,
+                    type: handlerType,
+                    filePath: handlerFile,
+                    confidence: conf,
+                  });
+                }
+              }
+              for (const candidates of groupedHandlers.values()) {
+                const symbolCandidates = candidates.filter((c) => c.type !== 'File');
+                const chosen = symbolCandidates.length > 0 ? symbolCandidates : candidates;
+                for (const c of chosen) {
+                  edges.push({
+                    id: c.id,
+                    name: c.name,
+                    type: c.type,
+                    filePath: c.filePath,
+                    relType: 'HANDLES_ROUTE',
+                    confidence: c.confidence,
+                    sourceId: c.sourceId,
+                  });
+                }
+              }
+            }
+          } catch (e) {
+            rethrowSymbolIdentityError(e);
+            logQueryError('impact:cross-boundary-routes', e);
+          }
+        }
+
         // The pdg bridge is the ONE consumer here that accumulates sequentially
         // rather than per-node: at depth ≥ 2 an edge inherits
         // `pdgBridgeEvidenceById.get(sourceId)` — a LIVE read of the very map
@@ -9258,6 +9664,7 @@ export class LocalBackend {
         for (const edge of [...bestEdgeByNode.values()].sort(compareImpactFrontierEdges)) {
           visited.add(edge.id);
           nextFrontier.push(edge.id);
+          if (edge.filePath) filePathByNodeId.set(edge.id, edge.filePath);
           const storedConfidence = edge.confidence;
           const relationType = edge.relType;
           // Prefer the stored confidence from the graph (set at analysis time);

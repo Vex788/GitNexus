@@ -305,6 +305,42 @@ export const commitDistanceToHead = (repoPath: string, ancestor: string): number
   }
 };
 
+/**
+ * Symmetric commit distance (`git rev-list --count <commit>...HEAD`) when
+ * `commit` and HEAD share a `git merge-base`, or null when they share no
+ * history (or git fails). `isAncestor` is true when `commit` is a direct
+ * ancestor of HEAD (including `distance === 0` when `commit` resolves to HEAD).
+ */
+export const sharedHistoryCommitDistance = (
+  repoPath: string,
+  commit: string,
+): { distance: number; isAncestor: boolean } | null => {
+  const ancestorDistance = commitDistanceToHead(repoPath, commit);
+  if (ancestorDistance !== null) {
+    return { distance: ancestorDistance, isAncestor: true };
+  }
+  try {
+    const mergeBase = execFileSync('git', ['merge-base', commit, 'HEAD'], {
+      cwd: repoPath,
+      stdio: ['ignore', 'pipe', 'ignore'],
+      windowsHide: true,
+      encoding: 'utf8',
+    }).trim();
+    if (!mergeBase) return null;
+    const count = Number(
+      execFileSync('git', ['rev-list', '--count', `${commit}...HEAD`], {
+        cwd: repoPath,
+        stdio: ['ignore', 'pipe', 'ignore'],
+        windowsHide: true,
+        encoding: 'utf8',
+      }).trim(),
+    );
+    return Number.isInteger(count) && count >= 0 ? { distance: count, isAncestor: false } : null;
+  } catch {
+    return null;
+  }
+};
+
 export const getCurrentCommit = (repoPath: string): string => {
   try {
     return execSync('git rev-parse HEAD', {

@@ -8,6 +8,10 @@ export const isTemplateRouteCandidate = (filePath: string): boolean => {
     normalized.endsWith('.htm') ||
     normalized.endsWith('.ejs') ||
     normalized.endsWith('.hbs') ||
+    normalized.endsWith('.jsp') ||
+    normalized.endsWith('.jspf') ||
+    normalized.endsWith('.tag') ||
+    normalized.endsWith('.xhtml') ||
     isBladeTemplateFilename(normalized)
   );
 };

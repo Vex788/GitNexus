@@ -376,7 +376,13 @@ export const describeSharedGraph = (
   path.dirname(path.resolve(graphPath)) === path.resolve(storagePath) ? 'private' : 'shared';
 
 /** Files a shared checkout keeps in `<checkout>/.gitnexus`; everything else there is legacy. */
-const POINTER_DIR_KEEP = new Set([SHARED_STORE_POINTER, '.gitignore', 'run.cjs']);
+const POINTER_DIR_KEEP = new Set([
+  SHARED_STORE_POINTER,
+  '.gitignore',
+  'run.cjs',
+  'built-at-commit',
+  'last-sync-ts',
+]);
 
 /**
  * Whether `<checkout>/.gitnexus` is absent, a real directory inside the
@@ -420,9 +426,26 @@ export const writeSharedStorePointer = async (
   const probe = await probePointerDir(checkoutPath);
   if (probe.status !== 'contained') return;
   const { dir } = probe;
+  const payload: Record<string, unknown> = {
+    version: 1,
+    storeKey: layout.key,
+    checkoutSlot: layout.checkoutSlot,
+  };
+  try {
+    const raw = await fs.readFile(path.join(layout.checkoutSlot, INDEX_METADATA_FILE), 'utf-8');
+    const slotMeta = JSON.parse(raw) as { lastCommit?: unknown; indexedAt?: unknown };
+    if (typeof slotMeta.lastCommit === 'string' && slotMeta.lastCommit) {
+      payload.lastCommit = slotMeta.lastCommit;
+    }
+    if (typeof slotMeta.indexedAt === 'string' && slotMeta.indexedAt) {
+      payload.indexedAt = slotMeta.indexedAt;
+    }
+  } catch {
+    // Slot metadata may not exist yet in standalone pointer tests.
+  }
   await fs.writeFile(
     path.join(dir, SHARED_STORE_POINTER),
-    `${JSON.stringify({ version: 1, storeKey: layout.key, checkoutSlot: layout.checkoutSlot }, null, 2)}\n`,
+    `${JSON.stringify(payload, null, 2)}\n`,
   );
   await fs.writeFile(path.join(dir, '.gitignore'), '*\n', { flag: 'wx' }).catch(() => {});
 };

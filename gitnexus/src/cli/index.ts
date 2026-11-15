@@ -609,6 +609,27 @@ program
   .option('--branch <name>', 'Scope to a specific branch index (multi-branch repos)')
   .action(createLbugLazyAction(() => import('./tool.js'), 'checkCommand'));
 
+program
+  .command('route-map [route]')
+  .alias('route_map')
+  .description('Show FE<->BE route mappings, handlers, and consumers')
+  .option('--route <route>', 'Filter by route path (alias for positional argument)')
+  .option('-r, --repo <name>', 'Target repository')
+  .option('--branch <name>', 'Scope to a specific branch index (multi-branch repos)')
+  .option('-l, --limit <n>', 'Max routes to return')
+  .action(createLbugLazyAction(() => import('./tool.js'), 'routeMapCommand'));
+
+program
+  .command('api-impact [route]')
+  .alias('api_impact')
+  .description('Pre-change blast radius report for an API/Stripes/Servlet route or handler file')
+  .option('--route <route>', 'Route path (alias for positional argument)')
+  .option('-f, --file <path>', 'Handler file path (alternative to route)')
+  .option('-m, --method <verb>', 'Optional HTTP verb filter (GET, POST, etc.)')
+  .option('-r, --repo <name>', 'Target repository')
+  .option('--branch <name>', 'Scope to a specific branch index (multi-branch repos)')
+  .action(createLbugLazyAction(() => import('./tool.js'), 'apiImpactCommand'));
+
 // ─── Eval Server (persistent daemon for SWE-bench) ─────────────────
 
 program

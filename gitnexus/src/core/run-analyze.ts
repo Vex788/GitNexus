@@ -3221,8 +3221,11 @@ async function runFullAnalysisInner(
       // surfaces it as a hard failure (#1169) rather than silently registering a
       // possibly half-finalized index. `isRepoRegistered` is only read on the
       // opt-in branch so the common fast path keeps its single-stat cost.
+      const flatSharedSlot = Boolean(writeTarget.sharedStore && !placement.branch);
       const healUnregistered =
-        options.allowDuplicateName === true && !(await isRepoRegistered(repoPath));
+        !flatSharedSlot &&
+        options.allowDuplicateName === true &&
+        !(await isRepoRegistered(repoPath));
       if (reconciledCleanCoverage) {
         try {
           existingMeta.indexCoverage = {

@@ -54,6 +54,25 @@ async function getBackend(): Promise<LocalBackend> {
  * exit-code test below — pre-formatting it into a string would hide the very
  * fields that test reads.
  */
+function writeAllSync(fd: number, payload: string): void {
+  const buf = Buffer.from(payload, 'utf8');
+  let offset = 0;
+  const waitArr = new Int32Array(new SharedArrayBuffer(4));
+  while (offset < buf.length) {
+    try {
+      const written = writeSync(fd, buf, offset, buf.length - offset);
+      if (written <= 0) break;
+      offset += written;
+    } catch (err: any) {
+      if (err?.code === 'EAGAIN' || err?.code === 'EWOULDBLOCK' || err?.code === 'EINTR') {
+        Atomics.wait(waitArr, 0, 0, 2);
+        continue;
+      }
+      throw err;
+    }
+  }
+}
+
 function output<T>(data: T, render?: (data: T) => string): void {
   const text = render
     ? render(data)
@@ -63,7 +82,7 @@ function output<T>(data: T, render?: (data: T) => string): void {
         // indentation made impact results ~45% larger with no added information.
         JSON.stringify(data, null, process.stdout.isTTY ? 2 : undefined);
   try {
-    writeSync(1, text + '\n');
+    writeAllSync(1, text + '\n');
   } catch (err: any) {
     if (err?.code === 'EPIPE') {
       // Consumer closed the pipe (e.g., `gitnexus cypher ... | head -1`)
@@ -530,4 +549,55 @@ export async function traceCommand(
     });
     process.exit(1);
   }
+}
+
+export async function routeMapCommand(
+  route?: string,
+  options?: {
+    route?: string;
+    repo?: string;
+    branch?: string;
+    limit?: string;
+  },
+): Promise<void> {
+  const resolvedRoute = route?.trim() || options?.route?.trim();
+  const limit = parseLimit(options?.limit);
+  const backend = await getBackend();
+  const result = await backend.callTool('route_map', {
+    route: resolvedRoute || undefined,
+    repo: options?.repo,
+    branch: options?.branch,
+  });
+  if (limit !== undefined && result && typeof result === 'object' && Array.isArray((result as any).routes)) {
+    (result as any).routes = (result as any).routes.slice(0, limit);
+  }
+  output(result);
+}
+
+export async function apiImpactCommand(
+  route?: string,
+  options?: {
+    route?: string;
+    file?: string;
+    method?: string;
+    repo?: string;
+    branch?: string;
+  },
+): Promise<void> {
+  const resolvedRoute = route?.trim() || options?.route?.trim();
+  if (!resolvedRoute && !options?.file?.trim()) {
+    output({
+      error: 'api_impact requires either a <route> argument or --file <handlerPath>',
+    });
+    process.exit(1);
+  }
+  const backend = await getBackend();
+  const result = await backend.callTool('api_impact', {
+    route: resolvedRoute || undefined,
+    file: options?.file?.trim() || undefined,
+    method: options?.method?.trim() || undefined,
+    repo: options?.repo,
+    branch: options?.branch,
+  });
+  output(result);
 }

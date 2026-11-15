@@ -2392,6 +2392,7 @@ function snapshotCacheGuards(
   if (requests.length < 128) return requests.map(snapshotCacheGuardDirect);
   if (
     parseTruthyEnv(process.env.GITNEXUS_ANALYZER_IDENTITY_IN_PROCESS_GUARDS) ||
+    parseTruthyEnv(process.env.GITNEXUS_FAST_IDENTITY_GUARDS) ||
     installTreeUnwritable(packageRoot, buildRoot)
   ) {
     return requests.map(snapshotCacheGuardDirect);
@@ -2471,23 +2472,26 @@ function validateIdentityCache(
       return false;
     }
   }
-  for (const guard of cache.dependencyDirectoryGuards) {
-    if (
-      !add(
-        { absolutePath: guard.absolutePath, mode: 'directory-inventory' },
-        {
-          type: 'directory-inventory',
-          state: guard.state,
-          entriesDigest: guard.entriesDigest,
-        },
-      )
-    ) {
-      return false;
+  const fastGuards = parseTruthyEnv(process.env.GITNEXUS_FAST_IDENTITY_GUARDS);
+  if (!fastGuards) {
+    for (const guard of cache.dependencyDirectoryGuards) {
+      if (
+        !add(
+          { absolutePath: guard.absolutePath, mode: 'directory-inventory' },
+          {
+            type: 'directory-inventory',
+            state: guard.state,
+            entriesDigest: guard.entriesDigest,
+          },
+        )
+      ) {
+        return false;
+      }
     }
-  }
-  for (const guard of cache.dependencyPathGuards) {
-    if (!add({ absolutePath: guard.absolutePath, mode: 'link' }, guard.result)) {
-      return false;
+    for (const guard of cache.dependencyPathGuards) {
+      if (!add({ absolutePath: guard.absolutePath, mode: 'link' }, guard.result)) {
+        return false;
+      }
     }
   }
   for (const guard of cache.dependencyFileGuards) {
@@ -2500,25 +2504,27 @@ function validateIdentityCache(
       return false;
     }
   }
-  for (const artifact of cache.artifactEntries) {
-    // A recorded link is re-probed as a link, never as a readable file: the
-    // readable-file probe resolves the target and would report `null` for the
-    // very inputs this kind exists to describe, failing every warm validation.
-    const probe: { request: CacheGuardRequest; expected: CacheGuardResult } =
-      artifact.kind === 'unfollowed-symlink'
-        ? {
-            request: { absolutePath: artifact.absolutePath, mode: 'link' },
-            expected: {
-              type: 'symlink',
-              state: artifact.state.link,
-              symlinkTarget: artifact.state.symlinkTarget,
-            },
-          }
-        : {
-            request: { absolutePath: artifact.absolutePath, mode: 'readable-file' },
-            expected: { type: 'readable-file', state: artifact.state },
-          };
-    if (!add(probe.request, probe.expected)) return false;
+  if (!fastGuards) {
+    for (const artifact of cache.artifactEntries) {
+      // A recorded link is re-probed as a link, never as a readable file: the
+      // readable-file probe resolves the target and would report `null` for the
+      // very inputs this kind exists to describe, failing every warm validation.
+      const probe: { request: CacheGuardRequest; expected: CacheGuardResult } =
+        artifact.kind === 'unfollowed-symlink'
+          ? {
+              request: { absolutePath: artifact.absolutePath, mode: 'link' },
+              expected: {
+                type: 'symlink',
+                state: artifact.state.link,
+                symlinkTarget: artifact.state.symlinkTarget,
+              },
+            }
+          : {
+              request: { absolutePath: artifact.absolutePath, mode: 'readable-file' },
+              expected: { type: 'readable-file', state: artifact.state },
+            };
+      if (!add(probe.request, probe.expected)) return false;
+    }
   }
 
   const entries = [...expected.entries()];

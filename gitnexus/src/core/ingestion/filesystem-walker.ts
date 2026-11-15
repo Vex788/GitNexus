@@ -8,6 +8,7 @@ import {
   filterDotDirectorySymlinks,
 } from './utils/include-dot-dirs.js';
 import fs from 'fs/promises';
+import * as nodeFs from 'node:fs';
 import { readdir } from 'node:fs';
 import path from 'path';
 import { glob, globIterate } from 'glob';
@@ -143,6 +144,7 @@ export const walkRepositoryPaths = async (
         options.onPathsDiscovered === undefined
           ? undefined
           : {
+              ...nodeFs,
               readdir(directory, readOptions, callback) {
                 readdir(directory, readOptions, (error, entries) => {
                   if (error && !isAbsentListedRoot(directory, error)) enumerationError ??= error;

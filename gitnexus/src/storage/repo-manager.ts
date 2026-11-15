@@ -50,7 +50,11 @@ import {
   type AnalyzerRunnerIdentity,
   type RepoMeta,
 } from './repo-meta.js';
-import { resolveGraphPath } from './shared-store.js';
+import {
+  resolveGraphPath,
+  SHARED_STORE_POINTER,
+  storeRootOfCheckoutSlot,
+} from './shared-store.js';
 import {
   defaultStoragePath,
   ensureStoragePathWritable,
@@ -330,6 +334,27 @@ export const saveMeta = async (metaDir: string, meta: RepoMeta): Promise<void> =
     await writeFileAtomic(path.join(metaDir, LEGACY_METADATA_FILE), json);
   } catch (err) {
     logger.warn({ err, metaDir }, 'Failed to write legacy meta.json mirror (non-critical)');
+  }
+  // Self-update `<repoPath>/.gitnexus/store.json` freshness fields when saving a shared checkout slot.
+  if (meta.repoPath && meta.lastCommit && storeRootOfCheckoutSlot(metaDir)) {
+    try {
+      const ptrPath = path.join(meta.repoPath, GITNEXUS_DIR, SHARED_STORE_POINTER);
+      const rawPtr = await fs.readFile(ptrPath, 'utf-8');
+      const parsedPtr = JSON.parse(rawPtr) as Record<string, unknown>;
+      if (
+        parsedPtr &&
+        typeof parsedPtr === 'object' &&
+        !Array.isArray(parsedPtr) &&
+        typeof parsedPtr.checkoutSlot === 'string' &&
+        path.resolve(parsedPtr.checkoutSlot) === path.resolve(metaDir)
+      ) {
+        parsedPtr.lastCommit = meta.lastCommit;
+        if (meta.indexedAt) parsedPtr.indexedAt = meta.indexedAt;
+        await writeFileAtomic(ptrPath, `${JSON.stringify(parsedPtr, null, 2)}\n`);
+      }
+    } catch {
+      // Pointer may be written later in the analyze flow; non-critical here.
+    }
   }
 };
 

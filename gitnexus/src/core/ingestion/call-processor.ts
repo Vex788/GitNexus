@@ -751,7 +751,7 @@ const matchSpecificity = (fetchURL: string, routeURL: string): number => {
  * often. A tie (`/api/[param]` against `/api/foo` and `/api/bar`) has no
  * evidence for either, so it links none.
  */
-export const matchFetchRouteKeys = (
+const matchFetchRouteKeysExact = (
   normalized: string,
   routeUrlToKeys: Map<string, string[]>,
 ): string[] | undefined => {
@@ -765,6 +765,21 @@ export const matchFetchRouteKeys = (
     if (score > bestScore) [best, bestScore] = [routeKeys, score];
   }
   return tied ? undefined : best;
+};
+
+export const matchFetchRouteKeys = (
+  normalized: string,
+  routeUrlToKeys: Map<string, string[]>,
+): string[] | undefined => {
+  const direct = matchFetchRouteKeysExact(normalized, routeUrlToKeys);
+  if (direct) return direct;
+  // Stripes event fallback: `/foo.xhtml!someEvent` falls back to base `/foo.xhtml`
+  // when the event is inherited or handled dynamically by `@DefaultHandler`.
+  const bangIdx = normalized.indexOf('!');
+  if (bangIdx > 0) {
+    return matchFetchRouteKeysExact(normalized.slice(0, bangIdx), routeUrlToKeys);
+  }
+  return undefined;
 };
 
 /**
@@ -801,11 +816,8 @@ export const processNextjsFetchRoutes = (
   for (const call of fetchCalls) {
     const normalized = normalizeFetchURL(call.fetchURL);
     if (!normalized) continue;
-    for (const routeURL of routeUrlToKeys.keys()) {
-      if (routeMatches(normalized, routeURL)) {
-        routeCountByFile.set(call.filePath, (routeCountByFile.get(call.filePath) ?? 0) + 1);
-        break;
-      }
+    if (matchFetchRouteKeys(normalized, routeUrlToKeys)) {
+      routeCountByFile.set(call.filePath, (routeCountByFile.get(call.filePath) ?? 0) + 1);
     }
   }
 

@@ -22,10 +22,10 @@ import fs from 'fs/promises';
 import path from 'path';
 import { acquireIndexLock, requireExclusiveIndexLock } from '../storage/index-lock.js';
 import {
-  commitDistanceToHead,
   getRemoteUrl,
   hasGitDir,
   isWorkingTreePristine,
+  sharedHistoryCommitDistance,
 } from '../storage/git.js';
 import {
   canonicalizePath,
@@ -279,26 +279,32 @@ const listCommitGraphs = async (layout: SharedStoreLayout): Promise<CommitGraph[
   return graphs;
 };
 
+const MAX_SIBLING_SEED_COMMIT_DISTANCE = 5_000;
+
 /**
  * Pick the commit graph to seed a new checkout slot from: the one at HEAD,
- * else the ancestor with the fewest commits to HEAD. Ties go to the most
- * recently indexed graph.
- * ponytail: one `git` call pair per commit graph; fine for tens of graphs,
- * batch through `git rev-list` if stores grow to hundreds.
+ * else the shared-history commit graph with the smallest symmetric commit
+ * distance to HEAD (preferring direct ancestors on ties, then the most
+ * recently indexed graph). Bounded for non-ancestors so ancient branches fall
+ * back cleanly; unrelated orphan histories never match.
  */
 const pickSeed = (
   repoPath: string,
   graphs: CommitGraph[],
-): { graph: CommitGraph; distance: number } | null => {
-  let best: { graph: CommitGraph; distance: number } | null = null;
+): { graph: CommitGraph; distance: number; isAncestor: boolean } | null => {
+  let best: { graph: CommitGraph; distance: number; isAncestor: boolean } | null = null;
   for (const graph of graphs) {
-    const distance = commitDistanceToHead(repoPath, graph.commit);
-    if (distance === null) continue;
+    const rel = sharedHistoryCommitDistance(repoPath, graph.commit);
+    if (rel === null) continue;
+    if (!rel.isAncestor && rel.distance > MAX_SIBLING_SEED_COMMIT_DISTANCE) continue;
     const better =
       !best ||
-      distance < best.distance ||
-      (distance === best.distance && graph.meta.indexedAt > best.graph.meta.indexedAt);
-    if (better) best = { graph, distance };
+      rel.distance < best.distance ||
+      (rel.distance === best.distance && rel.isAncestor && !best.isAncestor) ||
+      (rel.distance === best.distance &&
+        rel.isAncestor === best.isAncestor &&
+        graph.meta.indexedAt > best.graph.meta.indexedAt);
+    if (better) best = { graph, distance: rel.distance, isAncestor: rel.isAncestor };
   }
   return best;
 };
@@ -308,8 +314,8 @@ const pickSeed = (
  * as its private graph. Used before the store has any commit graph: the main
  * checkout was indexed before its first worktree existed, or a worktree still
  * has its pre-store index. The source is left untouched (R12). Returns false
- * when the source is missing, not an ancestor of HEAD, busy, or not
- * consolidated.
+ * when the source is missing, shares no bounded git history with HEAD, busy,
+ * or not consolidated.
  */
 const seedFromLocalIndex = async (
   slot: string,
@@ -318,11 +324,11 @@ const seedFromLocalIndex = async (
   log: Log,
 ): Promise<boolean> => {
   let sourceGraph = resolveGraphPath(source);
-  const usable = (m: RepoMeta | null): m is RepoMeta =>
-    !!m &&
-    !m.incrementalInProgress &&
-    !!m.lastCommit &&
-    commitDistanceToHead(repoPath, m.lastCommit) !== null;
+  const usable = (m: RepoMeta | null): m is RepoMeta => {
+    if (!m || m.incrementalInProgress || !m.lastCommit) return false;
+    const rel = sharedHistoryCommitDistance(repoPath, m.lastCommit);
+    return rel !== null && (rel.isAncestor || rel.distance <= MAX_SIBLING_SEED_COMMIT_DISTANCE);
+  };
   if (!usable(await loadMeta(source)) || !(await exists(sourceGraph))) return false;
   let lock;
   try {
@@ -394,6 +400,7 @@ export const seedSharedSlot = async (
   // provenance, but never authorize current adoption from another parser.
   const upToDate =
     seed !== undefined &&
+    picked?.isAncestor === true &&
     picked?.distance === 0 &&
     isWorkingTreePristine(repoPath) &&
     canReuseGraph(seed.meta);

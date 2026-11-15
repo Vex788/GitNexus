@@ -1619,11 +1619,15 @@ export async function runChunkedParseAndResolve(
     // provider without naming a language in the shared parse phase.
     prepareRouteConstantsByProvider(repoConstants, getProviderForFile);
   }
-  if (allDecoratorRoutes.some((dr) => dr.routePathExpr !== undefined)) {
+  if (
+    allDecoratorRoutes.some(
+      (dr) => dr.routePathExpr !== undefined || dr.prefixExpr !== undefined,
+    )
+  ) {
     const resolvedRoutes: ExtractedDecoratorRoute[] = [];
     let skipped = 0;
     for (const dr of allDecoratorRoutes) {
-      if (dr.routePathExpr === undefined) {
+      if (dr.routePathExpr === undefined && dr.prefixExpr === undefined) {
         resolvedRoutes.push(dr);
         continue;
       }
@@ -1632,16 +1636,34 @@ export async function runChunkedParseAndResolve(
       // provider hook; everything else uses the shared language-agnostic
       // operand fold. No language names in the shared layer.
       const fold = getProviderForFile(dr.filePath)?.foldRoutePathOperands;
-      const value = dr.routePathOperands
-        ? fold
-          ? fold(dr.filePath, dr.routePathOperands, repoConstants)
-          : resolveOperands(dr.filePath, dr.routePathOperands, repoConstants)
-        : null;
-      if (value === null) {
-        skipped++;
-        continue;
+      const evalOps = (ops: NonNullable<ExtractedDecoratorRoute['routePathOperands']>) =>
+        fold ? fold(dr.filePath, ops, repoConstants) : resolveOperands(dr.filePath, ops, repoConstants);
+
+      let nextRoutePath = dr.routePath;
+      if (dr.routePathExpr !== undefined) {
+        const value = dr.routePathOperands ? evalOps(dr.routePathOperands) : null;
+        if (value === null) {
+          skipped++;
+          continue;
+        }
+        nextRoutePath = value;
       }
-      resolvedRoutes.push({ ...dr, routePath: value });
+
+      let nextPrefix = dr.prefix;
+      if (dr.prefixExpr !== undefined) {
+        const prefValue = dr.prefixOperands ? evalOps(dr.prefixOperands) : null;
+        if (prefValue === null) {
+          skipped++;
+          continue;
+        }
+        nextPrefix = prefValue;
+      }
+
+      resolvedRoutes.push({
+        ...dr,
+        routePath: nextRoutePath,
+        ...(nextPrefix !== undefined ? { prefix: nextPrefix } : {}),
+      });
     }
     allDecoratorRoutes.length = 0;
     for (const dr of resolvedRoutes) allDecoratorRoutes.push(dr);

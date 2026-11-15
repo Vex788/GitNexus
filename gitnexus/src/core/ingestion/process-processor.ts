@@ -216,7 +216,13 @@ export const processProcesses = async (
   onProgress?.(`Found ${allTraces.length} traces, deduplicating...`, 60);
 
   // Step 3: Deduplicate similar traces (subset removal)
-  const uniqueTraces = deduplicateTraces(allTraces, isSink);
+  const routeHandlers = new Set<string>();
+  knowledgeGraph.forEachRelationshipFields((sourceId, _targetId, type) => {
+    if (type === 'HANDLES_ROUTE' && !sourceId.startsWith('File:')) {
+      routeHandlers.add(sourceId);
+    }
+  });
+  const uniqueTraces = deduplicateTraces(allTraces, isSink, (id) => routeHandlers.has(id));
 
   // Step 3b: Deduplicate by entry+terminal pair (keep longest path per pair)
   const endpointDeduped = deduplicateByEndpoints(uniqueTraces);
@@ -463,6 +469,69 @@ const isTraceableCallsEdge = (
 ): boolean =>
   type === 'CALLS' && confidence >= MIN_TRACE_CONFIDENCE && !isHeuristicEdgeReason(reason);
 
+const appendUniqueTarget = (adj: AdjacencyList, fromId: string, toId: string): void => {
+  const existing = adj.get(fromId);
+  if (existing === undefined) {
+    adj.set(fromId, [toId]);
+  } else if (!existing.includes(toId)) {
+    existing.push(toId);
+  }
+};
+
+/**
+ * Bridge frontend callables that issue HTTP requests (`File -[FETCHES |via:<id>]-> Route`
+ * or `Callable -[FETCHES]-> Route`) directly to the backend handler symbols serving
+ * those routes (`Handler -[HANDLES_ROUTE]-> Route`), enabling end-to-end FE -> BE Process traces.
+ */
+const collectCrossBoundaryRoutePairs = (
+  graph: KnowledgeGraph,
+): Array<[callerId: string, handlerId: string]> => {
+  const callersByRoute = new Map<string, string[]>();
+  const handlersByRoute = new Map<string, string[]>();
+
+  graph.forEachRelationshipFields((sourceId, targetId, type, confidence, reason) => {
+    if (type === 'FETCHES' && confidence >= MIN_TRACE_CONFIDENCE) {
+      if (!sourceId.startsWith('File:')) {
+        appendUniqueTarget(callersByRoute, targetId, sourceId);
+      } else if (typeof reason === 'string' && reason.includes('|via:')) {
+        for (const match of reason.matchAll(/\|via:([^|]+)/g)) {
+          const viaId = match[1];
+          if (viaId && graph.getNode(viaId)) {
+            appendUniqueTarget(callersByRoute, targetId, viaId);
+          }
+        }
+      }
+    } else if (type === 'HANDLES_ROUTE' && !sourceId.startsWith('File:')) {
+      appendUniqueTarget(handlersByRoute, targetId, sourceId);
+    }
+  });
+
+  const pairs: Array<[string, string]> = [];
+  for (const [routeId, callers] of callersByRoute) {
+    let handlers = handlersByRoute.get(routeId);
+    if (!handlers || handlers.length === 0) {
+      const routeNode = graph.getNode(routeId);
+      const handlerSymId = routeNode?.properties.handlerSymbolId;
+      if (
+        typeof handlerSymId === 'string' &&
+        !handlerSymId.startsWith('File:') &&
+        graph.getNode(handlerSymId)
+      ) {
+        handlers = [handlerSymId];
+      }
+    }
+    if (!handlers || handlers.length === 0) continue;
+    for (const callerId of callers) {
+      for (const handlerId of handlers) {
+        if (callerId !== handlerId) {
+          pairs.push([callerId, handlerId]);
+        }
+      }
+    }
+  }
+  return pairs;
+};
+
 const buildCallsGraph = (graph: KnowledgeGraph): AdjacencyList => {
   const adj = new Map<string, string[]>();
 
@@ -473,6 +542,10 @@ const buildCallsGraph = (graph: KnowledgeGraph): AdjacencyList => {
     if (existing === undefined) adj.set(sourceId, [targetId]);
     else existing.push(targetId);
   });
+
+  for (const [callerId, handlerId] of collectCrossBoundaryRoutePairs(graph)) {
+    appendUniqueTarget(adj, callerId, handlerId);
+  }
 
   return adj;
 };
@@ -833,6 +906,8 @@ export const deduplicateTraces = (
   traces: string[][],
   /** See `buildSinkFunctionSet` — a sink-terminated trace survives subsumption. */
   isSink: (nodeId: string) => boolean = () => false,
+  /** Backend HTTP route handlers stay independently linkable via Route -[ENTRY_POINT_OF]-> Process. */
+  isRouteEntry: (nodeId: string) => boolean = () => false,
 ): string[][] => {
   if (traces.length === 0) return [];
 
@@ -842,52 +917,24 @@ export const deduplicateTraces = (
   // representative is otherwise decided by insertion order.
   const sorted = sortByDepthThenPath(traces);
   const unique: string[][] = [];
-  // Keys for `unique`, built ONCE per surviving trace rather than once per
-  // COMPARISON. The join used to sit inside the `some()` callback below, so
-  // every already-kept trace had its key rebuilt from scratch against every
-  // candidate — O(T*U) joins of O(depth * id-length) characters, and it is that
-  // allocation, not the substring scan, that dominates the pass.
-  //
-  // Nothing about breadth-first search made that safe; it only kept the cost
-  // small by keeping traces short. Measured on this repo, the walk went from an
-  // average of 4.3 steps to 9.4 when D1 made it depth-first, which roughly
-  // doubles both the number of surviving traces and the length of every key —
-  // so the same quadratic that was affordable under BFS is ~6x the work under
-  // DFS. Hoisting the join removes the multiplication entirely.
   const uniqueKeys: string[] = [];
 
   for (const trace of sorted) {
-    // A SINK-TERMINATED trace is never redundant (R3-6), even though it is by
-    // definition a prefix of the longer chain that runs on past the sink into
-    // helpers. That is the whole shape of a business flow — scan, score, arm,
-    // PLACE THE ORDER — so subsuming it here is exactly what kept such flows
-    // from ever being processes. Emitting one at the walk and deleting it one
-    // step later would have been a no-op fix.
+    const entry = trace[0];
     const terminal = trace[trace.length - 1];
-    // PADDED with the separator on both ends, so `includes` can only match whole
-    // steps (#2894). Unpadded, the test is not anchored to a step boundary and a
-    // match may begin in the MIDDLE of a node id:
-    //
-    //   'X->AA->B'.includes('A->B')   ->  true
-    //
-    // which discards `A -> B` as redundant against a chain `A` is not a step of
-    // at all. Measured inert on every corpus tried — the collision needs one id
-    // to be a strict suffix of another, which real ids
-    // (`Function:<path>:<name>`) do not produce — but the predicate did not mean
-    // what the surrounding code says it means, and this is a function whose
-    // entire job is deciding what to delete.
-    //
-    // Note the encoding assumes `->` never appears IN a node id. A C++
-    // `operator->` would defeat the join regardless of padding; out of scope
-    // here, but the assumption is real.
     const traceKey = `->${trace.join('->')}->`;
     if (terminal !== undefined && isSink(terminal)) {
       unique.push(trace);
       uniqueKeys.push(traceKey);
       continue;
     }
-    // Check if this trace is a subset of any already-added trace
-    const isSubset = uniqueKeys.some((existingKey) => existingKey.includes(traceKey));
+    const entryPrefix = entry !== undefined ? `->${entry}->` : '';
+    const isSubset =
+      entry !== undefined && isRouteEntry(entry)
+        ? uniqueKeys.some(
+            (existingKey) => existingKey.startsWith(entryPrefix) && existingKey.includes(traceKey),
+          )
+        : uniqueKeys.some((existingKey) => existingKey.includes(traceKey));
 
     if (!isSubset) {
       unique.push(trace);

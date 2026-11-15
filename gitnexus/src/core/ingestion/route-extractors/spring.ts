@@ -361,7 +361,234 @@ export function extractSpringRoutes(
     }
   }
 
+  routes.push(...extractStripesAndServletRoutes(tree, filePath, lineOffset));
+
   return routes;
+}
+
+const SERVLET_METHOD_TO_HTTP: Readonly<Record<string, string>> = {
+  doGet: 'GET',
+  doPost: 'POST',
+  doPut: 'PUT',
+  doDelete: 'DELETE',
+  doHead: 'HEAD',
+  doOptions: 'OPTIONS',
+};
+
+function annotationStringValuesByKeys(
+  ann: Parser.SyntaxNode,
+  acceptedKeys: ReadonlySet<string>,
+): string[] {
+  const args = ann.childForFieldName('arguments');
+  if (!args) return [];
+  const out: string[] = [];
+  const pushLit = (lit: Parser.SyntaxNode): void => {
+    const v = unquoteSpringLiteral(lit.text);
+    if (v !== null) out.push(v);
+  };
+  const pushVal = (val: Parser.SyntaxNode): void => {
+    if (val.type === 'string_literal') pushLit(val);
+    else if (val.type === 'element_value_array_initializer') {
+      for (const el of val.namedChildren) if (el.type === 'string_literal') pushLit(el);
+    }
+  };
+  for (const child of args.namedChildren) {
+    if (child.type === 'string_literal' || child.type === 'element_value_array_initializer') {
+      pushVal(child);
+    } else if (child.type === 'element_value_pair') {
+      const k = child.childForFieldName('key')?.text;
+      if (!k || !acceptedKeys.has(k)) continue;
+      const v = child.childForFieldName('value');
+      if (v) pushVal(v);
+    }
+  }
+  return out;
+}
+
+function normalizeStripesUrlBinding(raw: string): string | null {
+  let cleaned = raw
+    .trim()
+    .replace(/\/\{\$?event(?:=[^}]*)?\}/g, '')
+    .replace(/\{([^}=]+)=[^}]*\}/g, '{$1}');
+  if (!cleaned) return null;
+  if (!cleaned.startsWith('/')) cleaned = `/${cleaned}`;
+  return cleaned;
+}
+
+function normalizeServletUrlPattern(raw: string): string | null {
+  const trimmed = raw.trim();
+  if (!trimmed || trimmed === '/' || trimmed === '/*' || trimmed.startsWith('*.')) return null;
+  if (trimmed.endsWith('/*')) {
+    return `${trimmed.slice(0, -2)}/[...path]` || null;
+  }
+  return trimmed.startsWith('/') ? trimmed : `/${trimmed}`;
+}
+
+function isStripesResolutionMethod(methodNode: Parser.SyntaxNode): boolean {
+  const modifiers = methodNode.namedChildren.find((c) => c.type === 'modifiers');
+  if (modifiers && /\b(?:private|protected|static)\b/.test(modifiers.text)) return false;
+  const retType = methodNode.childForFieldName('type')?.text ?? '';
+  const simpleRet = retType.split('.').pop()?.replace(/<.*$/, '') ?? '';
+  return simpleRet.endsWith('Resolution');
+}
+
+/**
+ * Extract Stripes `@UrlBinding` (+ `@DefaultHandler`, `@HandlesEvent`, and public
+ * `Resolution` event handlers) and Java EE / Jakarta `@WebServlet` routes.
+ */
+function extractStripesAndServletRoutes(
+  tree: Parser.Tree,
+  filePath: string,
+  lineOffset: number,
+): ExtractedDecoratorRoute[] {
+  const out: ExtractedDecoratorRoute[] = [];
+  const pkgDecl = tree.rootNode.namedChildren.find((c) => c.type === 'package_declaration');
+  const pkgName = pkgDecl
+    ? pkgDecl.text
+        .replace(/^package\s+/, '')
+        .replace(/;\s*$/, '')
+        .trim()
+    : '';
+
+  const URL_BINDING_KEYS = new Set(['value']);
+  const WEB_SERVLET_KEYS = new Set(['value', 'urlPatterns']);
+
+  for (const match of TYPE_DECLARATION_QUERY.matches(tree.rootNode)) {
+    const typeNode = match.captures.find((c) => c.name === 'type')?.node;
+    if (typeNode?.type !== 'class_declaration') continue;
+    const className = typeNode.childForFieldName('name')?.text;
+    if (!className) continue;
+
+    const classAnns = declarationAnnotations(typeNode);
+
+    // 1. Stripes @UrlBinding
+    for (const ann of classAnns) {
+      if (annotationName(ann) !== 'UrlBinding') continue;
+      const rawBindings = annotationStringValuesByKeys(ann, URL_BINDING_KEYS);
+      for (const rawBinding of rawBindings) {
+        const basePath = normalizeStripesUrlBinding(rawBinding);
+        if (!basePath) continue;
+
+        const routeNames = pkgName ? [className, `${pkgName}.${className}`] : [className];
+        const methods = directMethods(typeNode);
+        let defaultHandler: { name: string; line: number } | undefined;
+        let firstResolutionHandler: { name: string; line: number } | undefined;
+        const eventHandlers = new Map<string, { name: string; line: number }>();
+
+        for (const mNode of methods) {
+          const mName = mNode.childForFieldName('name')?.text;
+          if (!mName) continue;
+          const mLine = mNode.startPosition.row + lineOffset;
+          const mAnns = declarationAnnotations(mNode);
+          const isRes = isStripesResolutionMethod(mNode);
+
+          if (isRes && !firstResolutionHandler) {
+            firstResolutionHandler = { name: mName, line: mLine };
+          }
+
+          let hasExplicitEvent = false;
+          for (const mAnn of mAnns) {
+            const mAnnName = annotationName(mAnn);
+            if (mAnnName === 'DefaultHandler' && !defaultHandler) {
+              defaultHandler = { name: mName, line: mAnn.startPosition.row + lineOffset };
+            } else if (mAnnName === 'HandlesEvent') {
+              const evs = annotationStringValuesByKeys(mAnn, URL_BINDING_KEYS);
+              for (const ev of evs) {
+                if (ev.trim()) {
+                  hasExplicitEvent = true;
+                  if (!eventHandlers.has(ev.trim())) {
+                    eventHandlers.set(ev.trim(), {
+                      name: mName,
+                      line: mAnn.startPosition.row + lineOffset,
+                    });
+                  }
+                }
+              }
+            }
+          }
+
+          // In Stripes, any public Resolution method without @HandlesEvent is
+          // addressable by its method name as an event (`?methodName`).
+          if (isRes && !hasExplicitEvent && !eventHandlers.has(mName)) {
+            eventHandlers.set(mName, { name: mName, line: mLine });
+          }
+        }
+
+        const primaryHandler = defaultHandler ?? firstResolutionHandler;
+        out.push({
+          filePath,
+          routePath: basePath,
+          httpMethod: '*',
+          decoratorName: 'UrlBinding',
+          lineNumber: primaryHandler?.line ?? ann.startPosition.row + lineOffset,
+          ...(primaryHandler ? { handlerName: primaryHandler.name } : {}),
+          routeNames,
+        });
+
+        for (const [evName, handler] of eventHandlers) {
+          out.push({
+            filePath,
+            routePath: `${basePath}!${evName}`,
+            httpMethod: '*',
+            decoratorName: 'HandlesEvent',
+            lineNumber: handler.line,
+            handlerName: handler.name,
+          });
+        }
+      }
+    }
+
+    // 2. Java EE / Jakarta @WebServlet
+    for (const ann of classAnns) {
+      if (annotationName(ann) !== 'WebServlet') continue;
+      const rawPatterns = annotationStringValuesByKeys(ann, WEB_SERVLET_KEYS);
+      const patterns = rawPatterns
+        .map(normalizeServletUrlPattern)
+        .filter((p): p is string => p !== null);
+      if (patterns.length === 0) continue;
+
+      const methods = directMethods(typeNode);
+      let emittedVerbMethod = false;
+      let fallbackServiceMethod: { name: string; line: number } | undefined;
+
+      for (const mNode of methods) {
+        const mName = mNode.childForFieldName('name')?.text;
+        if (!mName) continue;
+        const mLine = mNode.startPosition.row + lineOffset;
+        const verb = SERVLET_METHOD_TO_HTTP[mName];
+        if (verb) {
+          emittedVerbMethod = true;
+          for (const pat of patterns) {
+            out.push({
+              filePath,
+              routePath: pat,
+              httpMethod: verb,
+              decoratorName: 'WebServlet',
+              lineNumber: mLine,
+              handlerName: mName,
+            });
+          }
+        } else if ((mName === 'service' || mName === 'processRequest') && !fallbackServiceMethod) {
+          fallbackServiceMethod = { name: mName, line: mLine };
+        }
+      }
+
+      if (!emittedVerbMethod) {
+        for (const pat of patterns) {
+          out.push({
+            filePath,
+            routePath: pat,
+            httpMethod: '*',
+            decoratorName: 'WebServlet',
+            lineNumber: fallbackServiceMethod?.line ?? ann.startPosition.row + lineOffset,
+            ...(fallbackServiceMethod ? { handlerName: fallbackServiceMethod.name } : {}),
+          });
+        }
+      }
+    }
+  }
+
+  return out;
 }
 
 /**
