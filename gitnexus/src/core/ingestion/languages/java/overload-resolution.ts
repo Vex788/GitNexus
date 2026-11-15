@@ -36,6 +36,10 @@ import {
   type JavaTypeRelations,
   type JavaVerdict,
 } from './overload-types.js';
+import {
+  JAVA_PLATFORM_INTERFACE_MEMBERS,
+  platformInterfaceLacksMember,
+} from './platform-interface-members.js';
 
 interface TypeContext {
   readonly filePath: string;
@@ -356,9 +360,10 @@ function resolveTypeName(name: string, context: TypeContext, state: State): Java
     return unique.length === 1 ? sourceReference(unique[0]!) : UNKNOWN_JAVA_TYPE;
   }
   const platform = `java.lang.${name}`;
-  const imported: JavaType[] = KNOWN_JAVA_PLATFORM_TYPES.has(platform)
-    ? [qualifiedReference(platform, state)]
-    : [];
+  const imported: JavaType[] =
+    KNOWN_JAVA_PLATFORM_TYPES.has(platform) || JAVA_PLATFORM_INTERFACE_MEMBERS.has(platform)
+      ? [qualifiedReference(platform, state)]
+      : [];
   let unknownWildcard = false;
   for (const item of facts.imports) {
     if (item.static || !item.wildcard) continue;
@@ -777,6 +782,9 @@ function hierarchyComplete(
         )
           continue;
       }
+      // A JDK interface with a closed member inventory (Serializable, Cloneable, ...)
+      // cannot add an overload of a name it does not declare.
+      if (platformInterfaceLacksMember(base.name, memberName)) continue;
       return false;
     }
     const definition = state.scopes.defs.get(base.sourceId);
