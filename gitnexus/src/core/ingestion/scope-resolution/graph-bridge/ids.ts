@@ -576,6 +576,49 @@ export function resolveCallerGraphId(
   nodeLookup: GraphNodeLookup,
   atRange?: { startLine: number; startCol: number },
 ): string | undefined {
+  // Every call site in one scope resolves to the same caller anchor. A pass
+  // that emits hundreds of thousands of edges asks this question per site, so
+  // the walk (and its `visited` set) is memoised per (indexes, node lookup,
+  // scope). Keyed by both maps because a later pass can install a rebuilt
+  // node lookup after heritage emission, and a hit from the previous lookup
+  // would then name a node that lookup does not contain. `atRange` selects
+  // between sibling callables, so it opts out.
+  const memo = atRange === undefined ? callerIdMemoFor(scopes, nodeLookup) : undefined;
+  if (memo !== undefined && memo.has(startScope)) {
+    const cached = memo.get(startScope);
+    return cached === undefined ? undefined : cached;
+  }
+  const resolved = resolveCallerGraphIdUncached(startScope, scopes, nodeLookup, atRange);
+  if (memo !== undefined) memo.set(startScope, resolved);
+  return resolved;
+}
+
+type CallerIdMemo = Map<ScopeId, string | undefined>;
+const callerIdMemos = new WeakMap<ScopeResolutionIndexes, WeakMap<GraphNodeLookup, CallerIdMemo>>();
+
+function callerIdMemoFor(
+  scopes: ScopeResolutionIndexes,
+  nodeLookup: GraphNodeLookup,
+): CallerIdMemo {
+  let byLookup = callerIdMemos.get(scopes);
+  if (byLookup === undefined) {
+    byLookup = new WeakMap();
+    callerIdMemos.set(scopes, byLookup);
+  }
+  let memo = byLookup.get(nodeLookup);
+  if (memo === undefined) {
+    memo = new Map();
+    byLookup.set(nodeLookup, memo);
+  }
+  return memo;
+}
+
+function resolveCallerGraphIdUncached(
+  startScope: ScopeId,
+  scopes: ScopeResolutionIndexes,
+  nodeLookup: GraphNodeLookup,
+  atRange?: { startLine: number; startCol: number },
+): string | undefined {
   let current: ScopeId | null = cachedCallerLookupStart(startScope, scopes);
   const visited = new Set<ScopeId>();
   let lastFilePath: string | undefined;

@@ -62,8 +62,9 @@ it('honors bounded worker, pool, and embedding-thread overrides', () => {
   vi.stubEnv('GITNEXUS_EMBEDDING_THREADS', '8');
   const budget = resolveHostAnalysisResources({ includeEmbeddings: true });
   expect(budget.parse.workers).toBe(8);
-  expect(budget.parse.workerHeapMb).toBeGreaterThanOrEqual(512);
-  expect(budget.parse.workerHeapMb).toBe(budget.mainHeapMb);
+  // An explicit worker reservation is the worker's own planning bound; it is
+  // not raised to the main heap (see analysis-resource-budget PLANNING note).
+  expect(budget.parse.workerHeapMb).toBe(512);
   expect(budget.parse.reservedBytes).toBeLessThanOrEqual(budget.totalBytes);
   expect(budget.parse.graphPoolBytes).toBe(256 * 1024 ** 2);
   expect(budget.embedding.nativeThreads).toBe(8);

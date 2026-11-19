@@ -168,6 +168,45 @@ describe('createSearchFTSIndexes', () => {
     );
     expect(ready).toEqual(survivors.map((i) => i.indexName));
   });
+
+  it('stops at a build that never settles and reports the deadline', async () => {
+    // A wedged native indexer never resolves; only the deadline ends the wait.
+    vi.stubEnv('GITNEXUS_FTS_BUILD_TIMEOUT_MS', '20');
+    vi.mocked(createFTSIndex).mockImplementationOnce(() => new Promise<void>(() => {}));
+
+    const failures = await createSearchFTSIndexes();
+
+    const [wedged] = FTS_INDEXES;
+    expect(failures).toHaveLength(1);
+    expect(failures[0]).toMatchObject({
+      table: wedged.table,
+      indexName: wedged.indexName,
+      timedOut: true,
+    });
+    expect(failures[0].error).toContain('exceeded 20 ms');
+    // No further native write is attempted on a connection that just wedged.
+    expect(calls.filter((call) => call.startsWith('create:'))).toEqual([]);
+    expect(calls.filter((call) => call.startsWith('drop:'))).toEqual([
+      `drop:${wedged.table}.${wedged.indexName}`,
+    ]);
+  });
+
+  it('does not read the index catalog after a build deadline breach', async () => {
+    vi.stubEnv('GITNEXUS_FTS_BUILD_TIMEOUT_MS', '20');
+    vi.mocked(createFTSIndex).mockImplementationOnce(() => new Promise<void>(() => {}));
+    vi.mocked(readTables).mockResolvedValue([]);
+
+    const result = await buildSearchIndexesOrDegrade(readTables as never, {});
+
+    expect(result.ok).toBe(false);
+    expect(result.failureClass).toBe('capability');
+    if (!result.ok) expect(result.error).toContain('exceeded 20 ms');
+    // Verification would be another native read on the wedged connection.
+    const catalogReads = vi
+      .mocked(readTables)
+      .mock.calls.filter(([sql]) => typeof sql === 'string' && sql.includes('SHOW_INDEXES'));
+    expect(catalogReads).toEqual([]);
+  });
 });
 
 describe('verifySearchFTSIndexes', () => {

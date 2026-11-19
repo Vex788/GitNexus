@@ -9,6 +9,7 @@
 import { resolveGraphPath } from '../../storage/shared-store.js';
 import { relationshipIntegrityForCaller } from '../../core/graph/relationship-integrity.js';
 import fs from 'fs/promises';
+import { statSync } from 'node:fs';
 import path from 'path';
 import { createHash } from 'crypto';
 import {
@@ -1939,14 +1940,45 @@ export class LocalBackend {
     Promise<Awaited<ReturnType<typeof loadMeta>>>
   >();
 
+  // Handles are rebuilt on every `selectToolRepository`, so the WeakMap above
+  // never survives a second tool call: the read path used to re-read and
+  // JSON.parse the whole metadata file (measured 4.7 MB / 7 811 fileHashes for
+  // a PMS-sized index, ~15-20 ms per call, 15 % of the query-path CPU profile)
+  // for every `query`/`context`/`impact`. Cache the parsed, ingestion-stripped
+  // snapshot per index path, invalidated by the metadata file's identity.
+  private readonly toolMetadataByPath = new Map<
+    string,
+    { stamp: string; value: Promise<Awaited<ReturnType<typeof loadMeta>> | null> }
+  >();
+  private static readonly TOOL_METADATA_CACHE_LIMIT = 32;
+
+  /** Cheap change token for the metadata file, or 'missing' when unreadable. */
+  private static metadataStamp(metaDir: string): string {
+    let stamp = '';
+    for (const name of ['gitnexus.json', 'meta.json']) {
+      try {
+        const stat = statSync(path.join(metaDir, name));
+        stamp += `${name}:${stat.mtimeMs}:${stat.size};`;
+      } catch {
+        stamp += `${name}:missing;`;
+      }
+    }
+    return stamp;
+  }
+
   private readToolMetadata(repo: RepoHandle): Promise<Awaited<ReturnType<typeof loadMeta>>> {
+    const metaDir = path.dirname(repo.lbugPath);
+    const stamp = LocalBackend.metadataStamp(metaDir);
+    const cached = this.toolMetadataByPath.get(repo.lbugPath);
+    if (cached !== undefined && cached.stamp === stamp) return cached.value;
+
     let pending = this.toolMetadata.get(repo);
     if (!pending) {
-      pending = loadOptionalMeta(path.dirname(repo.lbugPath)).then((meta) => {
+      pending = loadOptionalMeta(metaDir).then((meta) => {
         if (!meta) return null;
         if (
           (meta.graphPath !== undefined || meta.graphGeneration) &&
-          !metadataMatchesGraph(path.dirname(repo.lbugPath), meta, repo.lbugPath)
+          !metadataMatchesGraph(metaDir, meta, repo.lbugPath)
         ) {
           // A newer immutable path was published after this request resolved
           // its handle. Keep the old reader's metadata, never mix generations.
@@ -1968,6 +2000,12 @@ export class LocalBackend {
       });
       this.toolMetadata.set(repo, pending);
     }
+
+    if (this.toolMetadataByPath.size >= LocalBackend.TOOL_METADATA_CACHE_LIMIT) {
+      const oldest = this.toolMetadataByPath.keys().next().value;
+      if (oldest !== undefined) this.toolMetadataByPath.delete(oldest);
+    }
+    this.toolMetadataByPath.set(repo.lbugPath, { stamp, value: pending });
     return pending;
   }
 

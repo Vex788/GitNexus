@@ -57,6 +57,8 @@ import {
   type QualifiedYield,
 } from '../../utils/type-ref-chain.js';
 import {
+  hasNamespaceBindingChannels,
+  importFamilyBindingNames,
   lookupBindingsAt,
   lookupNameClaim,
   findReceiverTypeBinding,
@@ -483,6 +485,7 @@ export function propagateImportedReturnTypes(
   lookupOwnedMethods?: (ownerId: string, name: string) => readonly SymbolDefinition[],
 ): void {
   const moduleScopeByFile = index.moduleScopeByFile;
+  const namespaceChannels = hasNamespaceBindingChannels(indexes);
   // An awaited binding takes what the followed return type yields under
   // `await` — the provider's route, bound once here; see `followedStep`.
   const awaited: AwaitedFollow | undefined =
@@ -560,7 +563,14 @@ export function propagateImportedReturnTypes(
       // no augmentations exist for the scope, so the common case is
       // allocation-free. See I8.
       for (const importerScope of scopesByFile.get(filePath) ?? [importerModule]) {
-        for (const localName of namesAtScope(importerScope.id, indexes)) {
+        // Only import-family names can be mirrored, so the enumeration is
+        // pre-filtered instead of merging every binding channel for every
+        // name (see importFamilyBindingNames). Workspaces with a namespace
+        // channel are not enumerable per scope and keep the exhaustive walk.
+        const localNames = namespaceChannels
+          ? namesAtScope(importerScope.id, indexes)
+          : importFamilyBindingNames(importerScope.id, indexes);
+        for (const localName of localNames) {
           // Skip if importer already has a typeBinding for this name —
           // an explicit local annotation must win over import-derived.
           if (importerScope.typeBindings.has(localName)) continue;

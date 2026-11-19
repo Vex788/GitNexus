@@ -6,13 +6,15 @@
  * call-resolution path.
  */
 
-import type { ParsedFile, TypeRef } from 'gitnexus-shared';
+import type { BindingRef, ParsedFile, ScopeId, TypeRef } from 'gitnexus-shared';
 import { SupportedLanguages } from 'gitnexus-shared';
 import type { KnowledgeGraph } from '../../../graph/types.js';
 import { buildMro, defaultLinearize } from '../../scope-resolution/passes/mro.js';
 import { resolveDefGraphId } from '../../scope-resolution/graph-bridge/ids.js';
 import type { GraphNodeLookup } from '../../scope-resolution/graph-bridge/node-lookup.js';
 import {
+  hasNamespaceBindingChannels,
+  importFamilyBindingNames,
   isClassLike,
   lookupBindingsAt,
   lookupNameClaim,
@@ -160,6 +162,16 @@ function populateJavaCrossFileReturnTypes(
     if (cs.length > 0) classScopesByFile.set(parsed.filePath, cs);
   }
 
+  // Channels that only exist for languages with implicit namespace visibility
+  // (Dart, Swift, C#, PHP, Kotlin). This resolver never populates them, so the
+  // pre-filtered name enumeration below is exact — and if one ever appears, we
+  // fall back to the exhaustive walk instead of silently dropping a name.
+  const extraBindingChannels = hasNamespaceBindingChannels(indexes);
+  const importNamesFor = (scopeId: ScopeId): Iterable<string> =>
+    extraBindingChannels
+      ? namesAtScope(scopeId, indexes)
+      : importFamilyBindingNames(scopeId, indexes, (ref) => isClassLike(ref.def.type));
+
   for (const parsed of parsedFiles) {
     const importerModule = moduleScopeByFile.get(parsed.filePath);
     if (importerModule === undefined) continue;
@@ -168,7 +180,7 @@ function populateJavaCrossFileReturnTypes(
     ambiguousByFile.set(parsed.filePath, ambiguousMirrors);
     const importedFamilies: string[][] = [];
     importedFamiliesByFile.set(parsed.filePath, importedFamilies);
-    for (const name of namesAtScope(importerModule.id, indexes)) {
+    for (const name of importNamesFor(importerModule.id)) {
       const refs = lookupBindingsAt(importerModule.id, name, indexes);
       for (const ref of refs) {
         if (ref.origin !== 'import' && ref.origin !== 'reexport') continue;
@@ -221,18 +233,22 @@ function populateJavaCrossFileReturnTypes(
     const importerModule = moduleScopeByFile.get(parsed.filePath);
     if (importerModule === undefined) continue;
     const tb = importerModule.typeBindings as Map<string, TypeRef>;
-    const needed = new Set(parsed.referenceSites.map((site) => site.name));
-    for (const scope of parsed.scopes) {
-      for (const ref of scope.typeBindings.values()) needed.add(ref.rawName);
-    }
+    // Only names that exist somewhere as a return annotation can be mirrored —
+    // `returnNames` is the global set of them. Filtering BEFORE deduplicating
+    // keeps the working set to that (small) set instead of materialising every
+    // reference-site name of the file, which on a Java module is tens of
+    // thousands of strings per file and dominated the GC budget of this pass.
+    const ambiguous = ambiguousByFile.get(parsed.filePath);
+    const seen = new Set<string>();
+    const consider = (name: string): void => {
+      if (!returnNames.has(name) || tb.has(name) || ambiguous?.has(name)) return;
+      if (seen.has(name)) return;
+      seen.add(name);
 
-    for (const name of needed) {
-      if (tb.has(name) || !returnNames.has(name) || ambiguousByFile.get(parsed.filePath)?.has(name))
-        continue;
       const pending = [...(importedFamiliesByFile.get(parsed.filePath) ?? [])];
       const visited = new Set([parsed.filePath]);
       let candidate: TypeRef | undefined;
-      let ambiguous = false;
+      let isAmbiguous = false;
       while (pending.length > 0) {
         const family = pending.pop();
         if (family === undefined) break;
@@ -252,7 +268,7 @@ function populateJavaCrossFileReturnTypes(
                 (returnTypeId(candidate) !== undefined &&
                   returnTypeId(candidate) === returnTypeId(found)));
             if (!sameType) {
-              ambiguous = true;
+              isAmbiguous = true;
               break;
             }
           }
@@ -265,7 +281,12 @@ function populateJavaCrossFileReturnTypes(
           for (const dependency of importedFamiliesByFile.get(file) ?? []) pending.push(dependency);
         }
       }
-      if (!ambiguous && candidate !== undefined) tb.set(name, candidate);
+      if (!isAmbiguous && candidate !== undefined) tb.set(name, candidate);
+    };
+
+    for (const site of parsed.referenceSites) consider(site.name);
+    for (const scope of parsed.scopes) {
+      for (const ref of scope.typeBindings.values()) consider(ref.rawName);
     }
 
     for (const [name, ref] of importerModule.typeBindings) {

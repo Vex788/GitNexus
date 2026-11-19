@@ -91,14 +91,18 @@ describe('analysis resource admission', () => {
   );
 
   it.each([undefined, 512, 4096])(
-    'reserves inherited main-heap limits for worker override %s',
+    'reserves an independent worker heap for override %s',
     (workerHeapMb) => {
       const budget = resolveAnalysisResourceBudget({
         ...request,
         preferredWorkers: 16,
         workerHeapMb,
       });
-      expect(budget.parse.workerHeapMb).toBeGreaterThanOrEqual(budget.mainHeapMb);
+      // A worker holds one sub-batch, not a copy of the graph: its reservation
+      // is no longer tied to the main heap (see PLAN_WORKER_HEAP_MB).
+      expect(budget.parse.workerHeapMb).toBeGreaterThanOrEqual(512);
+      expect(budget.parse.workerHeapMb).toBeLessThanOrEqual(4096);
+      expect(budget.parse.workers).toBeGreaterThan(1);
       expect(budget.parse.reservedBytes).toBeLessThanOrEqual(budget.totalBytes);
     },
   );
@@ -169,7 +173,7 @@ describe('analysis resource admission', () => {
   });
 
   it.each([
-    [8192, 1],
+    [8192, 6],
     [1024, 6],
   ])('admits a %s MiB main heap with %s fitting workers', (mainHeapMb, workers) => {
     const budget = resolveAnalysisResourceBudget({
@@ -180,7 +184,9 @@ describe('analysis resource admission', () => {
     });
     expect(budget.mainHeapMb).toBe(mainHeapMb);
     expect(budget.parse.workers).toBe(workers);
-    expect(budget.parse.workerHeapMb).toBeGreaterThanOrEqual(mainHeapMb);
+    // The worker reservation is its own planning bound, not the main heap.
+    expect(budget.parse.workerHeapMb).toBeGreaterThanOrEqual(512);
+    expect(budget.parse.workerHeapMb).toBeLessThanOrEqual(4096);
     expect(budget.parse.reservedBytes).toBeLessThanOrEqual(budget.totalBytes);
     expect(budget.automatic).toBe(false);
     expect(Object.isFrozen(budget)).toBe(true);

@@ -315,6 +315,55 @@ export interface FtsIndexBuildFailure {
   indexName: string;
   /** The raw LadybugDB message, unmodified — it is the only row-level evidence there is. */
   error: string;
+  /**
+   * The native build exceeded `GITNEXUS_FTS_BUILD_TIMEOUT_MS` and never
+   * settled. A wedged engine must not be asked to verify or build again on the
+   * same connection: every further native write can block the same way.
+   */
+  timedOut?: boolean;
+}
+
+const DEFAULT_FTS_BUILD_TIMEOUT_MS = 180_000;
+
+/**
+ * Per-index deadline for the native `CREATE_FTS_INDEX`.
+ *
+ * A truncated `File.content` index can wedge inside the engine itself: a
+ * measured run at full content retention sat for >10 minutes with every
+ * TaskScheduler thread parked in
+ * `HashIndexLocalStorage<string>::lookup -> std::__shared_mutex_base::lock_shared`
+ * while the analyze process waited on one unresolved promise (staging DB
+ * 959 MB, WAL 349 B, CPU ~1 %). The healthy 23-index build on the same corpus
+ * takes ~8 s, so a deadline converts "hangs forever" into a reported,
+ * searchable-graph-still-published degradation. 0 disables the deadline.
+ */
+function resolveFtsBuildTimeoutMs(): number {
+  const raw = process.env.GITNEXUS_FTS_BUILD_TIMEOUT_MS;
+  if (raw === undefined || raw.trim() === '') return DEFAULT_FTS_BUILD_TIMEOUT_MS;
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : DEFAULT_FTS_BUILD_TIMEOUT_MS;
+}
+
+class FtsBuildTimeoutError extends Error {}
+
+/** Reject (never resolve) when `work` exceeds `ms`; the native work keeps running. */
+function withBuildDeadline<T>(work: Promise<T>, ms: number, label: string): Promise<T> {
+  if (ms <= 0) return work;
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      reject(new FtsBuildTimeoutError(`native index build for ${label} exceeded ${ms} ms`));
+    }, ms);
+    work.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (error) => {
+        clearTimeout(timer);
+        reject(error);
+      },
+    );
+  });
 }
 
 /**
@@ -345,6 +394,7 @@ export async function createSearchFTSIndexes(
     (index) => !options?.tables || options.tables.has(index.table),
   );
   const emptyTables = await readEmptyFtsTables(executeQuery, indexes);
+  const buildDeadlineMs = resolveFtsBuildTimeoutMs();
   for (const { table, indexName, properties } of indexes) {
     options?.onIndexStart?.(table, indexName);
     // Drop first so the live `properties` always win. `createFTSIndex` is
@@ -362,12 +412,25 @@ export async function createSearchFTSIndexes(
     try {
       await dropFTSIndex(table, indexName);
       if (!emptyTables.has(table)) {
-        await createFTSIndex(table, indexName, [...properties], stemmer);
+        await withBuildDeadline(
+          createFTSIndex(table, indexName, [...properties], stemmer),
+          buildDeadlineMs,
+          `${table}.${indexName}`,
+        );
       }
     } catch (e) {
       // The message, never the Error: holding the Error would pin its stack and
       // whatever the native binding attached to it, for up to one per table.
-      failures.push({ table, indexName, error: e instanceof Error ? e.message : String(e) });
+      const timedOut = e instanceof FtsBuildTimeoutError;
+      failures.push({
+        table,
+        indexName,
+        error: e instanceof Error ? e.message : String(e),
+        ...(timedOut ? { timedOut: true } : {}),
+      });
+      // A wedged engine will block the next native write the same way. Stop
+      // touching this connection; the caller degrades keyword search.
+      if (timedOut) break;
       continue;
     }
     options?.onIndexReady?.(table, indexName);
@@ -596,10 +659,18 @@ export async function buildSearchIndexesOrDegrade(
     const diagnostics: FtsIndexVerificationDiagnostic[] = [];
     let missing: string[] = [];
     let verificationError: string | undefined;
+    // A build deadline breach means the engine is wedged inside this
+    // connection: a catalog read on the same handle can block identically, so
+    // report the timeout instead of issuing one more native query.
+    const buildTimedOut = failures.some((failure) => failure.timedOut === true);
     try {
-      missing = await verifySearchFTSIndexes(executeQuery, indexes, (diagnostic) =>
-        diagnostics.push(diagnostic),
-      );
+      if (buildTimedOut) {
+        verificationError = summarizeFtsIndexBuildFailures(failures, indexes);
+      } else {
+        missing = await verifySearchFTSIndexes(executeQuery, indexes, (diagnostic) =>
+          diagnostics.push(diagnostic),
+        );
+      }
     } catch (e) {
       // A failed catalog read is unknown, not absence. Keep the native build
       // failures already collected rather than replacing them with this error.

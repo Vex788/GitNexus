@@ -138,6 +138,71 @@ export function lookupNameClaim(
   );
 }
 
+/**
+ * True when this workspace populates a namespace-specific binding channel
+ * (`namespaceFqnBindings` / `workspaceFqnBindings` and the scope→namespace
+ * maps that reach them: Dart, Swift, C#, PHP, Kotlin). Those channels are
+ * consulted by {@link lookupBindingsAt} but are not enumerable per scope, so
+ * callers that pre-filter names must fall back to the exhaustive walk when one
+ * is present.
+ */
+export function hasNamespaceBindingChannels(scopes: ScopeResolutionIndexes): boolean {
+  return (
+    scopes.workspaceFqnBindings !== undefined ||
+    scopes.namespaceFqnBindings !== undefined ||
+    scopes.namespaceLookupTiersByScope !== undefined ||
+    scopes.accessibleNamespacesByScope !== undefined
+  );
+}
+
+/**
+ * Names bound at `scopeId` that carry at least one import/reexport/wildcard
+ * binding — the only names import-derived passes can act on.
+ *
+ * `namesAtScope` + `lookupBindingsAt` per name is the general form, but it pays
+ * a four-channel merge and a fresh array for EVERY name in the scope. A Java
+ * module binds every top-level type and every import while only a fraction are
+ * class-like imports, and the emit/propagation passes asked this question for
+ * every scope of every file. Enumerating the two flat channels once and
+ * filtering before the merge keeps those passes proportional to the bindings
+ * they can use.
+ *
+ * Callers MUST pass `scopes` with no namespace channel (see
+ * {@link hasNamespaceBindingChannels}) or accept that namespace-only bindings
+ * are absent from the enumeration; {@link lookupBindingsAt} remains the
+ * authority for a name this helper yields.
+ */
+export function* importFamilyBindingNames(
+  scopeId: ScopeId,
+  scopes: ScopeResolutionIndexes,
+  accept?: (ref: BindingRef) => boolean,
+): Iterable<string> {
+  const finalized = scopes.bindings.get(scopeId);
+  const augmented = scopes.bindingAugmentations.get(scopeId);
+  const qualifies = (refs: readonly BindingRef[] | undefined): boolean => {
+    if (refs === undefined) return false;
+    for (const ref of refs) {
+      if (ref.origin !== 'import' && ref.origin !== 'reexport' && ref.origin !== 'wildcard') {
+        continue;
+      }
+      if (accept !== undefined && !accept(ref)) continue;
+      return true;
+    }
+    return false;
+  };
+  if (finalized !== undefined) {
+    for (const [name, refs] of finalized) {
+      if (qualifies(refs)) yield name;
+    }
+  }
+  if (augmented !== undefined) {
+    for (const [name, refs] of augmented) {
+      if (finalized?.has(name) === true) continue;
+      if (qualifies(refs)) yield name;
+    }
+  }
+}
+
 /** Provider claims are strict; legacy records retain their historical kind namespaces. */
 export function hasExplicitNameClaim(claim: NameClaimResult, name: string): boolean {
   return (

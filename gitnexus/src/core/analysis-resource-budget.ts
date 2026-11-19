@@ -5,6 +5,18 @@ const VECTOR_POOL_MB = 64;
 const MIN_MAIN_HEAP_MB = 384;
 const MIN_WORKER_HEAP_MB = 512;
 const WORKER_NATIVE_MB = 128;
+/**
+ * Planning reservation for one parser worker's isolate: a sub-batch of source
+ * (default 8 MiB) plus its AST and extracted facts. Measured on the PMS corpus:
+ * a 2 MiB-chunk worker stays well under 200 MiB RSS, and a 7-worker run at a
+ * 1 029 MiB per-worker reservation peaked at 4.63 GiB total process RSS — the
+ * main heap, not the workers, dominates the footprint. 768 MiB keeps that
+ * headroom while still admitting the CPU-bound worker count on a 24 GiB host
+ * (the old formula admitted one worker there, and asked for eight only with a
+ * main heap too small to hold the graph). Deliberately independent of the main
+ * heap, see `resolveAnalysisResourceBudget`.
+ */
+const PLAN_WORKER_HEAP_MB = 768;
 
 export interface AnalysisResourceRequest {
   /** Effective process/container RAM, before reserving host headroom. */
@@ -193,24 +205,33 @@ export function resolveAnalysisResourceBudget(
   ) {
     throw new Error(`Worker heap reservation must be at least ${MIN_WORKER_HEAP_MB} MiB`);
   }
+  // A parser worker holds one sub-batch (GITNEXUS_WORKER_SUB_BATCH_MAX_BYTES,
+  // 8 MiB default; GITNEXUS_CHUNK_BYTE_BUDGET, 2 MiB default) of source plus its
+  // AST and extracted facts — not a copy of the graph. Sizing its reservation
+  // from `mainHeapMb` made worker count a function of RAM in the wrong
+  // direction: on a 24 GiB / 15-core host the old formula admitted ONE worker
+  // (parse 173.7 s for 8 333 files) and asked for 8 workers only at a main
+  // heap small enough to OOM the graph (measured: 1 360 MiB -> heap OOM).
+  // PLAN_WORKER_HEAP_MB is the measured planning bound for that working set;
+  // the hard bounds that keep it honest are the sub-batch/chunk byte budgets,
+  // MAX_FILE_SIZE, the pool's per-job timeouts and the process-wide
+  // heap-pressure abort. The pool still forwards it as
+  // `resourceLimits.maxOldGenerationSizeMb` (best effort: a large
+  // --max-old-space-size on the parent can override it).
+  const workerHeapPlanMb = explicitWorkerHeapMb ?? PLAN_WORKER_HEAP_MB;
+  const workersByPlan = Math.floor(workerBudgetMb / (workerHeapPlanMb + WORKER_NATIVE_MB));
   const workers = !includeParsing
     ? 0
     : request.workers === undefined
-      ? Math.min(
-          desiredWorkers,
-          Math.floor(
-            workerBudgetMb /
-              (Math.max(mainHeapMb, explicitWorkerHeapMb ?? MIN_WORKER_HEAP_MB) + WORKER_NATIVE_MB),
-          ),
-        )
+      ? Math.max(1, Math.min(desiredWorkers, workersByPlan))
       : desiredWorkers;
   const workerHeapMb = !includeParsing
     ? 0
-    : Math.max(
-        mainHeapMb,
-        explicitWorkerHeapMb ??
-          Math.min(4096, Math.floor(workerBudgetMb / Math.max(1, workers)) - WORKER_NATIVE_MB),
-      );
+    : (explicitWorkerHeapMb ??
+      Math.max(
+        MIN_WORKER_HEAP_MB,
+        Math.min(4096, Math.floor(workerBudgetMb / Math.max(1, workers)) - WORKER_NATIVE_MB),
+      ));
   const parseReservedMb =
     headroomMb +
     supervisorMb +

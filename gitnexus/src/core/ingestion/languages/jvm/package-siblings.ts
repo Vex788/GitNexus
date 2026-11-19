@@ -142,10 +142,13 @@ export function createJvmPackageSiblingVisibility(
       // so a truncated scope can merge its bounded set without rescanning the
       // whole package.
       const segmentsByPath = new Map<string, string[]>();
+      const segmentsByDir = new Map<string, string[]>();
       const moduleScopeByPath = new Map<string, PackageBucket['moduleScopes'][number]>();
       const parsedByPath = new Map<string, ParsedFile>();
       for (const parsed of bucket.parsed) {
         segmentsByPath.set(parsed.filePath, pathSegments(parsed.filePath));
+        const dir = directoryOf(parsed.filePath);
+        if (!segmentsByDir.has(dir)) segmentsByDir.set(dir, pathSegments(dir));
         parsedByPath.set(parsed.filePath, parsed);
       }
       for (const sibling of bucket.moduleScopes) moduleScopeByPath.set(sibling.filePath, sibling);
@@ -159,24 +162,30 @@ export function createJvmPackageSiblingVisibility(
         }
 
         const ownSegments = segmentsByPath.get(filePath) ?? pathSegments(filePath);
+        // Proximity is a property of (own file, candidate DIRECTORY), not of the
+        // pair of files: every candidate in one directory shares the same path
+        // prefix with the own file. Keying the cache by file made a flat
+        // package (one directory, the common Java shape) pay O(files²) segment
+        // walks and re-split every path per comparison; keying by directory
+        // collapses that to one walk per directory.
         const proximityCache = new Map<string, number>();
+        const proximityOf = (candidatePath: string): number => {
+          const dir = directoryOf(candidatePath);
+          const cached = proximityCache.get(dir);
+          if (cached !== undefined) return cached;
+          const segments = segmentsByDir.get(dir) ?? pathSegments(dir);
+          const shared = sharedSegmentCount(segments, ownSegments);
+          proximityCache.set(dir, shared);
+          return shared;
+        };
         const candidates = classDefs.filter((candidate) => candidate.filePath !== filePath);
-        for (const candidate of candidates) {
-          if (!proximityCache.has(candidate.filePath)) {
-            proximityCache.set(
-              candidate.filePath,
-              sharedSegmentCount(segmentsByPath.get(candidate.filePath) ?? [], ownSegments),
-            );
-          }
-        }
+        for (const candidate of candidates) proximityOf(candidate.filePath);
         // Nearest-first by shared path prefix. Ties (the common case in a flat
         // package, where every sibling shares the same directory) keep the
         // walker's traversal order, so the retained set is deterministic but
         // arbitrary among equally-near candidates — which is why truncation
         // marks the file incomplete below rather than being treated as exact.
-        candidates.sort(
-          (a, b) => (proximityCache.get(b.filePath) ?? 0) - (proximityCache.get(a.filePath) ?? 0),
-        );
+        candidates.sort((a, b) => proximityOf(b.filePath) - proximityOf(a.filePath));
 
         const injectedIds = new Set<string>();
         const injectedPaths = new Set<string>();
@@ -332,6 +341,13 @@ export function createJvmPackageSiblingVisibility(
 
 function pathSegments(filePath: string): string[] {
   return filePath.replace(/\\/g, '/').split('/');
+}
+
+/** Directory part of a POSIX-normalized repo path, with its trailing slash. */
+function directoryOf(filePath: string): string {
+  const normalized = filePath.replace(/\\/g, '/');
+  const slash = normalized.lastIndexOf('/');
+  return slash === -1 ? '' : normalized.slice(0, slash + 1);
 }
 
 function sharedSegmentCount(aSegments: readonly string[], bSegments: readonly string[]): number {
